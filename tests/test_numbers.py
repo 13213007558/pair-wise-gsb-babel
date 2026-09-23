@@ -18,6 +18,7 @@ import pytest
 from babel import localedata, numbers
 from babel.numbers import (
     UnknownCurrencyError,
+    get_currency_cash_rounding,
     get_currency_precision,
     get_currency_unit_pattern,
     get_decimal_precision,
@@ -86,6 +87,15 @@ def test_get_currency_symbol():
 def test_get_currency_precision():
     assert get_currency_precision('EUR') == 2
     assert get_currency_precision('JPY') == 0
+
+
+def test_get_currency_cash_rounding():
+    # CHF cash amounts are rounded to the nearest 0.05
+    assert get_currency_cash_rounding('CHF') == (2, 5)
+    # USD has no specific cash rounding, so it uses its regular digits
+    assert get_currency_cash_rounding('USD') == (2, 0)
+    # Unknown currencies fall back to the CLDR default
+    assert get_currency_cash_rounding('XAB') == (2, 0)
 
 
 def test_get_currency_unit_pattern():
@@ -304,6 +314,110 @@ def test_format_currency_format_type():
     assert (numbers.format_currency(1099.98, 'COP', '#,##0.00', locale='es_ES',
                                     currency_digits=False)
             == '1.099,98')
+
+
+def test_format_currency_cash():
+    # CHF cash amounts are rounded to the nearest 0.05 (CLDR cashDigits=2,
+    # cashRounding=5); the standard format keeps the amount as-is.
+    assert (numbers.format_currency('1.03', 'CHF', locale='en_US')
+            == 'CHF1.03')
+    assert (numbers.format_currency('1.03', 'CHF', locale='en_US', cash=True)
+            == 'CHF1.05')
+    assert (numbers.format_currency('1.02', 'CHF', locale='en_US', cash=True)
+            == 'CHF1.00')
+    # Midpoints follow the decimal context's default ROUND_HALF_EVEN mode.
+    assert (numbers.format_currency('1.025', 'CHF', locale='en_US', cash=True)
+            == 'CHF1.00')
+    assert (numbers.format_currency('1.075', 'CHF', locale='en_US', cash=True)
+            == 'CHF1.10')
+    # Negative amounts round symmetrically.
+    assert (numbers.format_currency('-1.03', 'CHF', locale='en_US', cash=True)
+            == '-CHF1.05')
+    assert (numbers.format_currency('-1.025', 'CHF', locale='en_US', cash=True)
+            == '-CHF1.00')
+    # Rounding may carry over into the integer part.
+    assert (numbers.format_currency('1.999', 'CHF', locale='en_US', cash=True)
+            == 'CHF2.00')
+    # DKK cash rounds to the nearest 0.50 (cashRounding=50): the cash step
+    # is not a power of ten, so this is not just a change of fraction digits.
+    assert (numbers.format_currency('1.3', 'DKK', locale='en_US')
+            == 'DKK1.30')
+    assert (numbers.format_currency('1.3', 'DKK', locale='en_US', cash=True)
+            == 'DKK1.50')
+    # Currencies without a special cash step (USD, JPY) behave as usual.
+    assert (numbers.format_currency('1.03', 'USD', locale='en_US', cash=True)
+            == '$1.03')
+    assert (numbers.format_currency('1099.98', 'JPY', locale='en_US', cash=True)
+            == '\xa51,100')
+
+
+def test_format_currency_cash_decimal_context():
+    # The caller's decimal context rounding mode is honored, and switching
+    # it between calls is reflected in the results.
+    with decimal.localcontext() as ctx:
+        ctx.rounding = decimal.ROUND_HALF_UP
+        assert (numbers.format_currency('1.025', 'CHF', locale='en_US', cash=True)
+                == 'CHF1.05')
+        ctx.rounding = decimal.ROUND_HALF_EVEN
+        assert (numbers.format_currency('1.025', 'CHF', locale='en_US', cash=True)
+                == 'CHF1.00')
+        ctx.rounding = decimal.ROUND_HALF_UP
+        assert (numbers.format_currency('1.025', 'CHF', locale='en_US', cash=True)
+                == 'CHF1.05')
+        ctx.rounding = decimal.ROUND_DOWN
+        assert (numbers.format_currency('1.029', 'CHF', locale='en_US', cash=True)
+                == 'CHF1.00')
+
+
+def test_format_currency_cash_display_options():
+    # currency_digits=False with a custom pattern must not silently re-round
+    # the cash amount; the display precision is raised to the cash digits.
+    assert (numbers.format_currency('1.03', 'CHF', '#,##0.0', locale='en_US',
+                                    currency_digits=False)
+            == '1.0')
+    assert (numbers.format_currency('1.03', 'CHF', '#,##0.0', locale='en_US',
+                                    currency_digits=False, cash=True)
+            == '1.05')
+    # decimal_quantization=False keeps the cash-rounded amount, not the input.
+    assert (numbers.format_currency('1.03', 'CHF', locale='en_US',
+                                    decimal_quantization=False, cash=True)
+            == 'CHF1.05')
+    # Symbols, accounting negative signs, grouping and localized names are
+    # still driven by the locale and pattern.
+    assert (numbers.format_currency('-1.03', 'CHF', locale='en_US',
+                                    format_type='accounting', cash=True)
+            == '(CHF1.05)')
+    assert (numbers.format_currency('1234567.891', 'CHF', locale='en_US', cash=True)
+            == 'CHF1,234,567.90')
+    assert (numbers.format_currency('1.03', 'CHF', locale='de_CH', cash=True)
+            == 'CHF\xa01.05')
+
+
+def test_format_currency_cash_long_display_name():
+    # The plural form of the long currency name follows the actually
+    # displayed (cash-rounded) amount: 1,02 is "few" in Croatian, while the
+    # displayed 1,00 is "other".
+    assert (numbers.format_currency('1.02', 'CHF', locale='hr', format_type='name')
+            == '1,02 \u0161vicarska franka')
+    assert (numbers.format_currency('1.02', 'CHF', locale='hr', format_type='name',
+                                    cash=True)
+            == '1,00 \u0161vicarskih franaka')
+    # The same applies to the ¤¤¤ placeholder in custom patterns.
+    assert (numbers.format_currency('1.02', 'CHF', '#,##0.00 \xa4\xa4\xa4',
+                                    locale='hr')
+            == '1,02 \u0161vicarska franka')
+    assert (numbers.format_currency('1.02', 'CHF', '#,##0.00 \xa4\xa4\xa4',
+                                    locale='hr', cash=True)
+            == '1,00 \u0161vicarskih franaka')
+
+
+def test_format_currency_cash_unknown_currency():
+    # Without cash metadata, the CLDR default (2 digits, no increment)
+    # applies, so cash formatting matches the standard format.
+    assert (numbers.format_currency('1.035', 'XAB', locale='en_US')
+            == 'XAB1.04')
+    assert (numbers.format_currency('1.035', 'XAB', locale='en_US', cash=True)
+            == 'XAB1.04')
 
 
 def test_format_compact_currency():

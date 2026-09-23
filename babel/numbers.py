@@ -165,6 +165,47 @@ def get_currency_precision(currency: str) -> int:
     return precisions.get(currency, precisions['DEFAULT'])[0]
 
 
+def get_currency_cash_rounding(currency: str) -> tuple[int, int]:
+    """Return the currency's cash rounding parameters.
+
+    The result is a ``(cash_digits, cash_rounding)`` tuple, where
+    ``cash_digits`` is the number of decimals used for cash amounts and
+    ``cash_rounding`` is the rounding increment in units of
+    ``10 ** -cash_digits``.  For example, Swiss franc cash amounts are
+    rounded to the nearest 0.05, so ``get_currency_cash_rounding('CHF')``
+    returns ``(2, 5)``.
+
+    Currencies without specific cash data use their regular digits and
+    rounding, and unknown currencies fall back to the CLDR default of
+    ``(2, 0)``, i.e. two decimals and no rounding increment.
+
+    .. versionadded:: 2.19.0
+
+    :param currency: the currency code.
+    """
+    fractions = get_global('currency_fractions')
+    return fractions.get(currency, fractions['DEFAULT'])[2:]
+
+
+def _round_to_cash_step(
+    value: decimal.Decimal,
+    cash_digits: int,
+    cash_rounding: int,
+) -> decimal.Decimal:
+    """Round a decimal value to a currency's legal cash amount.
+
+    The rounding increment (``cash_rounding * 10 ** -cash_digits``) is not
+    necessarily a power of ten (e.g. 0.05 for CHF), so this cannot be
+    expressed as a plain quantization.  All arithmetic is done with
+    ``decimal.Decimal`` and honors the rounding mode of the current
+    decimal context.
+    """
+    if cash_rounding > 1:
+        step = decimal.Decimal(cash_rounding).scaleb(-cash_digits)
+        value = (value / step).quantize(decimal.Decimal(1)) * step
+    return value.quantize(get_decimal_quantum(cash_digits))
+
+
 def get_currency_unit_pattern(
     currency: str,  # TODO: unused?!
     count: float | decimal.Decimal | None = None,
@@ -711,6 +752,7 @@ def format_currency(
     format_type: Literal["name", "standard", "accounting"] = "standard",
     decimal_quantization: bool = True,
     group_separator: bool = True,
+    cash: bool = False,
     *,
     numbering_system: Literal["default"] | str = "latn",
 ) -> str:
@@ -791,6 +833,26 @@ def format_currency(
     >>> format_currency(1099.9876, 'USD', locale='en_US', decimal_quantization=False)
     '$1,099.9876'
 
+    Some currencies have a rounding increment for cash transactions that is
+    not a power of ten.  For example, Swiss franc cash amounts are rounded
+    to the nearest 0.05.  Pass ``cash=True`` to round the amount to the
+    currency's legal cash step (per CLDR ``cashDigits``/``cashRounding``)
+    before formatting, using the rounding mode of the current
+    ``decimal`` context:
+
+    >>> format_currency('1.03', 'CHF', locale='en_US')
+    'CHF1.03'
+    >>> format_currency('1.03', 'CHF', locale='en_US', cash=True)
+    'CHF1.05'
+
+    The cash-rounded amount always lands on a legal cash step; display
+    options such as ``currency_digits``, a custom ``format`` pattern or
+    ``decimal_quantization`` never silently re-round it to a different
+    amount.  Currencies without specific cash data behave as usual:
+
+    >>> format_currency('1.03', 'USD', locale='en_US', cash=True)
+    '$1.03'
+
     :param number: the number to format
     :param currency: the currency code
     :param format: the format string to use
@@ -802,6 +864,8 @@ def format_currency(
                                  the format pattern. Defaults to `True`.
     :param group_separator: Boolean to switch group separator on/off in a locale's
                             number format.
+    :param cash: round the amount to the currency's cash rounding increment
+                 before formatting. Defaults to `False`.
     :param numbering_system: The numbering system used for formatting number symbols. Defaults to "latn".
                              The special value "default" will use the default numbering system of the locale.
     :raise `UnsupportedNumberingSystemError`: If the numbering system is not supported by the locale.
@@ -817,6 +881,7 @@ def format_currency(
             currency_digits=currency_digits,
             decimal_quantization=decimal_quantization,
             group_separator=group_separator,
+            cash=cash,
             numbering_system=numbering_system,
         )
 
@@ -837,6 +902,7 @@ def format_currency(
         currency_digits=currency_digits,
         decimal_quantization=decimal_quantization,
         group_separator=group_separator,
+        cash=cash,
         numbering_system=numbering_system,
     )
 
@@ -850,6 +916,7 @@ def _format_currency_long_name(
     currency_digits: bool,
     decimal_quantization: bool,
     group_separator: bool,
+    cash: bool,
     numbering_system: Literal["default"] | str,
 ) -> str:
     # Algorithm described here:
@@ -862,6 +929,17 @@ def _format_currency_long_name(
 
     # Correct number to numeric type, important for looking up plural rules:
     number_n = float(number) if isinstance(number, str) else number
+
+    if cash:
+        # The plural form is chosen by the actually displayed amount, i.e.
+        # the amount rounded to the currency's cash step.  All arithmetic
+        # stays in Decimal land; no floats are involved.
+        cash_digits, cash_rounding = get_currency_cash_rounding(currency)
+        number_n = _round_to_cash_step(
+            decimal.Decimal(str(number_n)),
+            cash_digits,
+            cash_rounding,
+        )
 
     # Step 3.
     unit_pattern = get_currency_unit_pattern(currency, count=number_n, locale=locale)
@@ -882,6 +960,7 @@ def _format_currency_long_name(
         currency_digits=currency_digits,
         decimal_quantization=decimal_quantization,
         group_separator=group_separator,
+        cash=cash,
         numbering_system=numbering_system,
     )
 
@@ -1452,6 +1531,7 @@ class NumberPattern:
         decimal_quantization: bool = True,
         force_frac: tuple[int, int] | None = None,
         group_separator: bool = True,
+        cash: bool = False,
         *,
         numbering_system: Literal["default"] | str = "latn",
     ):
@@ -1478,6 +1558,11 @@ class NumberPattern:
         :param force_frac: DEPRECATED - a forced override for `self.frac_prec`
                            for a single formatting invocation.
         :param group_separator: Whether to use the locale's number group separator.
+        :param cash: Whether to round the value to the currency's cash
+                     rounding increment (per CLDR ``cashDigits`` and
+                     ``cashRounding``) before formatting, using the
+                     rounding mode of the current ``decimal`` context.
+                     Only takes effect when `currency` is set.
         :param numbering_system: The numbering system used for formatting number symbols. Defaults to "latn".
                                  The special value "default" will use the default numbering system of the locale.
         :return: Formatted decimal string.
@@ -1492,6 +1577,15 @@ class NumberPattern:
         # Separate the absolute value from its sign.
         is_negative = int(value.is_signed())
         value = abs(value).normalize()
+
+        # Round to the currency's legal cash amount, if requested.  The
+        # rounding increment is not necessarily a power of ten, so this is
+        # more than a change of fraction digits.  The cash-rounded value is
+        # also what the `¤¤¤` placeholder below pluralizes against.
+        cash_prec: tuple[int, int] | None = None
+        if cash and currency:
+            cash_prec = get_currency_cash_rounding(currency)
+            value = _round_to_cash_step(value, *cash_prec)
 
         # Prepare scientific notation metadata.
         if self.exp_prec:
@@ -1511,10 +1605,18 @@ class NumberPattern:
                 stacklevel=2,
             )
             frac_prec = force_frac
+        elif currency and currency_digits and cash_prec is not None:
+            frac_prec = (cash_prec[0],) * 2
         elif currency and currency_digits:
             frac_prec = (get_currency_precision(currency),) * 2
         else:
             frac_prec = self.frac_prec
+
+        if cash_prec is not None:
+            # The cash-rounded amount must survive formatting untouched:
+            # never let the display precision silently re-round it to a
+            # different amount.
+            frac_prec = (frac_prec[0], max(frac_prec[1], cash_prec[0]))
 
         # Bump decimal precision to the natural precision of the number if it
         # exceeds the one we're about to use. This adaptative precision is only
