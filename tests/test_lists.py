@@ -20,6 +20,12 @@ def test_format_list_error():
         lists.format_list(['a', 'b', 'c'], style='orange', locale='en')
 
 
+def test_format_list_two_items_without_two_pattern():
+    # The Arabic "unit-short" style has no "2" pattern; the "start" pattern
+    # is used instead of erroneously repeating the last item.
+    assert lists.format_list(['a', 'b'], style='unit-short', locale='ar') == 'a، وb'
+
+
 def test_issue_1098():
     one_foot = units.format_unit(1, "length-foot", length="short", locale="zh_CN")
     five_inches = units.format_unit(5, "length-inch", length="short", locale="zh_CN")

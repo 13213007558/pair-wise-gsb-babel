@@ -10,4 +10,6 @@ locales.
 
 .. autofunction:: format_compound_unit
 
+.. autofunction:: format_unit_list
+
 .. autofunction:: get_unit_name

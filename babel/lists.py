@@ -102,8 +102,12 @@ def format_list(
 
     patterns = _resolve_list_style(locale, style)
 
-    if len(lst) == 2 and '2' in patterns:
-        return patterns['2'].format(*lst)
+    if len(lst) == 2:
+        # Not all styles specify a "two" pattern; fall back to the "start"
+        # pattern rather than stitching the list together from start+end
+        # (which would repeat the last item).
+        pattern = patterns.get('2', patterns['start'])
+        return pattern.format(*lst)
 
     result = patterns['start'].format(lst[0], lst[1])
     for elem in lst[2:-1]:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import decimal
+from collections.abc import Sequence
 from typing import Literal
 
 from babel.core import Locale
+from babel.lists import format_list
 from babel.numbers import LC_NUMERIC, format_decimal
 
 
@@ -360,3 +362,111 @@ def format_compound_unit(
     )
 
     return per_pattern.format(formatted_numerator, formatted_denominator)
+
+
+#: Mapping from unit format lengths to the list pattern styles
+#: defined by CLDR for lists of units.
+_length_to_list_style = {
+    "long": "unit",
+    "short": "unit-short",
+    "narrow": "unit-narrow",
+}
+
+
+def format_unit_list(
+    values: Sequence[tuple[str | float | decimal.Decimal, str] | str],
+    length: Literal["short", "long", "narrow"] = "long",
+    format: str | None = None,
+    locale: Locale | str | None = None,
+    *,
+    numbering_system: Literal["default"] | str = "latn",
+) -> str:
+    """
+    Format a list of unit values, e.g. "3 feet, 2 inches".
+
+    Each item is a `(value, unit)` tuple, which is formatted with
+    `format_unit` (and thus honors the locale's pluralization rules and
+    number formats), or a preformatted string, which is used as-is.
+
+    The items are joined using the locale's list patterns for units,
+    so the conjunctions and separators follow the CLDR "two", "start",
+    "middle" and "end" patterns instead of a hard-coded comma.
+
+    >>> format_unit_list([(3, "foot"), (2, "inch")], locale="en")
+    '3 feet, 2 inches'
+
+    >>> format_unit_list([(3, "foot"), (2, "inch")], length="narrow", locale="en")
+    '3\u2032 2\u2033'
+
+    >>> format_unit_list([(3, "foot"), (2, "inch")], length="short", locale="zh")
+    '3\u82f1\u5c3a2\u82f1\u5bf8'
+
+    A single item is returned as-is, without list formatting:
+
+    >>> format_unit_list([(30, "kilometer-per-hour")], locale="zh")
+    '\u6bcf\u5c0f\u65f630\u516c\u91cc'
+
+    >>> format_unit_list([(1, "kilometer"), (200, "meter"), (30, "centimeter")], locale="ar")
+    '1 \u0643\u064a\u0644\u0648\u0645\u062a\u0631\u060c \u0648200 \u0645\u062a\u0631\u060c \u064830 \u0633\u0646\u062a\u064a\u0645\u062a\u0631'
+
+    Values may be `decimal.Decimal` instances; negative, zero and fractional
+    values are formatted like `format_unit` formats them:
+
+    >>> import decimal
+    >>> format_unit_list([(decimal.Decimal("-3.5"), "celsius"), (0, "fahrenheit")], locale="en")
+    '-3.5 degrees Celsius, 0 degrees Fahrenheit'
+
+    Preformatted strings can be mixed in, which allows compound units
+    (see `format_compound_unit`) to take part in a list:
+
+    >>> speed = format_compound_unit(30, "kilometer", denominator_unit="hour", locale="en")
+    >>> format_unit_list([speed, (20, "celsius")], locale="en")
+    '30 kilometers per hour, 20 degrees Celsius'
+
+    An empty list formats to an empty string:
+
+    >>> format_unit_list([], locale="en")
+    ''
+
+    Unknown units raise an exception:
+
+    >>> format_unit_list([(1, "horse")], locale="en")
+    Traceback (most recent call last):
+        ...
+    UnknownUnitError: horse is not a known unit in en
+
+    .. versionadded:: 2.19.0
+
+    :param values: a sequence of `(value, unit)` tuples as accepted by
+                   `format_unit`, or preformatted strings.
+    :param length: The formatting length. "short", "long" or "narrow"
+    :param format: An optional format, as accepted by `format_decimal`.
+    :param locale: the `Locale` object or locale identifier. Defaults to the system numeric locale.
+    :param numbering_system: The numbering system used for formatting number symbols. Defaults to "latn".
+                             The special value "default" will use the default numbering system of the locale.
+    :return: A formatted list of unit values.
+    :raise `UnknownUnitError`: If a unit is not known in the locale.
+    :raise `UnsupportedNumberingSystemError`: If the numbering system is not supported by the locale.
+    """
+    locale = Locale.parse(locale or LC_NUMERIC)
+
+    formatted_values = []
+    for item in values:
+        if isinstance(item, str):  # Preformatted, e.g. the result of `format_compound_unit`.
+            formatted_values.append(item)
+        else:
+            value, unit = item
+            formatted_values.append(format_unit(
+                value,
+                unit,
+                length=length,
+                format=format,
+                locale=locale,
+                numbering_system=numbering_system,
+            ))
+
+    return format_list(
+        formatted_values,
+        style=_length_to_list_style[length],
+        locale=locale,
+    )
