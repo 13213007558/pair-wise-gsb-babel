@@ -21,6 +21,8 @@ Date and Time Formatting
 
 .. autofunction:: format_interval(start, end, skeleton=None, tzinfo=None, fuzzy=True, locale=default_locale('LC_TIME'))
 
+.. autofunction:: format_interval_skeleton(skeleton, start, end, tzinfo=None, fuzzy=True, fallback='full', *, locale)
+
 Timezone Functionality
 ----------------------
 
