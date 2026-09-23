@@ -21,7 +21,9 @@ from babel.core import (
     UnknownLocaleError,
     default_locale,
     get_locale_identifier,
+    negotiate_accept_language,
     negotiate_locale,
+    parse_accept_language,
     parse_locale,
 )
 
@@ -33,6 +35,8 @@ __all__ = [
     '__version__',
     'default_locale',
     'get_locale_identifier',
+    'negotiate_accept_language',
     'negotiate_locale',
+    'parse_accept_language',
     'parse_locale',
 ]

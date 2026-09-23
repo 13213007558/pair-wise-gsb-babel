@@ -315,6 +315,163 @@ def test_negotiate_locale():
     assert core.negotiate_locale(['no', 'sv'], ['nb_NO', 'sv_SE']) == 'nb_NO'
 
 
+def test_parse_accept_language():
+    assert core.parse_accept_language('fr-CA, fr;q=0.8, en;q=0.6, *;q=0') == [
+        ('fr-CA', 1.0), ('fr', 0.8), ('en', 0.6), ('*', 0.0)
+    ]
+    # Ranges without a weight default to quality 1; whitespace and the case
+    # of the "q" parameter name are insignificant.
+    assert core.parse_accept_language('DE-ch ; Q=0.5') == [('DE-ch', 0.5)]
+    # Empty list elements are permitted by RFC 7230 and ignored.
+    assert core.parse_accept_language('en,, ,fr;q=0.1,') == [('en', 1.0), ('fr', 0.1)]
+    # Up to three decimal places are allowed in quality values.
+    assert core.parse_accept_language('en;q=0.125') == [('en', 0.125)]
+    assert core.parse_accept_language('en;q=1.000') == [('en', 1.0)]
+    # An empty or missing header parses to an empty list.
+    assert core.parse_accept_language('') == []
+    assert core.parse_accept_language(None) == []
+
+
+def test_parse_accept_language_invalid():
+    for header in [
+        'en;q=1.5',  # quality above 1
+        'en;q=2',  # quality above 1
+        'en;q=-0.5',  # negative quality
+        'en;q=0.1234',  # too many decimal places
+        'en;q=',  # missing quality value
+        'en;q=abc',  # quality is not a number
+        'en;q = 0.5',  # whitespace around "="
+        'en;q=0.5;q=0.6',  # duplicate quality parameter
+        'en;level=1',  # unknown parameter
+        'en;q=0.5;x=1',  # extension parameter
+        'en-',  # trailing dash
+        '-en',  # leading dash
+        'en--US',  # empty subtag
+        'en_US',  # underscore is not valid in a language range
+        'en US',  # whitespace inside the range
+        '*-en',  # wildcard is only valid on its own
+    ]:
+        with pytest.raises(ValueError, match='not a valid Accept-Language list item'):
+            core.parse_accept_language(header)
+
+
+def test_negotiate_accept_language():
+    available = ['de_DE', 'en_US', 'fr_CA', 'fr_FR']
+    assert core.negotiate_accept_language(
+        'fr-CA, fr;q=0.8, en;q=0.6, *;q=0', available
+    ) == 'fr_CA'
+    # The quality value decides before anything else.
+    assert core.negotiate_accept_language('de;q=0.5, en;q=0.9', available) == 'en_US'
+    # Nothing matched.
+    assert core.negotiate_accept_language('ja, sv', available) is None
+    # Empty header or empty availability list.
+    assert core.negotiate_accept_language('', available) is None
+    assert core.negotiate_accept_language(None, available) is None
+    assert core.negotiate_accept_language('en', []) is None
+    # An invalid header is rejected.
+    with pytest.raises(ValueError, match='not a valid Accept-Language list item'):
+        core.negotiate_accept_language('en;q=1.5', available)
+
+
+def test_negotiate_accept_language_tiebreaks():
+    # Equal qualities: the order of the ranges in the header decides.
+    assert core.negotiate_accept_language('en;q=0.5, fr;q=0.5', ['fr_FR', 'en_US']) == 'en_US'
+    assert core.negotiate_accept_language('fr;q=0.5, en;q=0.5', ['fr_FR', 'en_US']) == 'fr_FR'
+    # Same range matching several locales: the available list order decides.
+    # ("sw" is used because it has no entry in the default aliases)
+    assert core.negotiate_accept_language('sw', ['sw_TZ', 'sw_KE']) == 'sw_TZ'
+    assert core.negotiate_accept_language('sw', ['sw_KE', 'sw_TZ']) == 'sw_KE'
+    # A more specific match is preferred over a less specific one.
+    assert core.negotiate_accept_language('fr-CA', ['fr', 'fr_CA']) == 'fr_CA'
+
+
+def test_negotiate_accept_language_duplicate_ranges():
+    # The first occurrence of a duplicated range wins.
+    assert core.negotiate_accept_language(
+        'fr;q=0.3, fr;q=0.9, en;q=0.5', ['fr_FR', 'en_US']
+    ) == 'en_US'
+    assert core.negotiate_accept_language(
+        'fr;q=0.9, fr;q=0.3, en;q=0.5', ['fr_FR', 'en_US']
+    ) == 'fr_FR'
+
+
+def test_negotiate_accept_language_wildcard():
+    # The wildcard matches anything not matched by a more specific range.
+    assert core.negotiate_accept_language('*', ['de_DE', 'en_US']) == 'de_DE'
+    assert core.negotiate_accept_language('en;q=0.9, *;q=0.1', ['de_DE', 'en_US']) == 'en_US'
+    # A q=0 wildcard excludes everything not explicitly allowed.
+    assert core.negotiate_accept_language('en, *;q=0', ['de_DE', 'en_US']) == 'en_US'
+    assert core.negotiate_accept_language('*;q=0', ['de_DE']) is None
+
+
+def test_negotiate_accept_language_exclusions():
+    available = ['fr_CA', 'fr_FR', 'en_US']
+    # An explicit q=0 range excludes its matches even if broader ranges
+    # (or the wildcard) would allow them, regardless of the range order.
+    assert core.negotiate_accept_language('fr-CA;q=0, fr;q=0.8, *;q=0.5', available) == 'fr_FR'
+    assert core.negotiate_accept_language('fr;q=0.8, *;q=0.5, fr-CA;q=0', available) == 'fr_FR'
+    # An explicit allowance beats a broader exclusion, in either order.
+    assert core.negotiate_accept_language('fr;q=0, fr-CA;q=0.5', available) == 'fr_CA'
+    assert core.negotiate_accept_language('fr-CA;q=0.5, fr;q=0', available) == 'fr_CA'
+    # Everything excluded.
+    assert core.negotiate_accept_language('fr-CA;q=0, fr;q=0, en;q=0', available) is None
+
+
+def test_negotiate_accept_language_lookup_fallback():
+    # RFC 4647 lookup: ranges fall back by truncating subtags from the right.
+    assert core.negotiate_accept_language('fr-CA', ['fr_FR']) == 'fr_FR'
+    assert core.negotiate_accept_language('de-CH', ['de']) == 'de'
+    # Available locales more specific than the range also match.
+    assert core.negotiate_accept_language('fr', ['fr_FR']) == 'fr_FR'
+    # Extended tails of language tags are truncated as well.
+    assert core.negotiate_accept_language('en-US-x-twain', ['en_US']) == 'en_US'
+    assert core.negotiate_accept_language('ca-ES-valencia', ['ca_ES_VALENCIA']) == 'ca_ES_VALENCIA'
+    assert core.negotiate_accept_language('ca-ES', ['ca_ES_VALENCIA']) == 'ca_ES_VALENCIA'
+
+
+def test_negotiate_accept_language_script_fallback():
+    available = ['zh_Hans_CN', 'zh_Hant_TW']
+    assert core.negotiate_accept_language('zh-Hant', available) == 'zh_Hant_TW'
+    assert core.negotiate_accept_language('zh-Hans', available) == 'zh_Hans_CN'
+    # A script in the range never falls back to a different script.
+    assert core.negotiate_accept_language('zh-Hans', ['zh_Hant_TW']) is None
+    assert core.negotiate_accept_language('zh-Hant-TW', ['zh_Hans_CN']) is None
+    # A range without a script may match either script.
+    assert core.negotiate_accept_language('zh', available) == 'zh_Hans_CN'
+    # A scripted range may fall back to a locale without a script.
+    assert core.negotiate_accept_language('zh-Hant', ['zh']) == 'zh'
+
+
+def test_negotiate_accept_language_aliases():
+    # Babel's default language aliases are honored, as with negotiate_locale.
+    assert core.negotiate_accept_language('no', ['nb_NO', 'sv_SE']) == 'nb_NO'
+    # Aliases also apply to exclusions.
+    assert core.negotiate_accept_language('no;q=0, *;q=0.5', ['nb_NO', 'sv_SE']) == 'sv_SE'
+    # Aliases can be disabled.
+    assert core.negotiate_accept_language('no', ['nb_NO'], aliases=None) is None
+
+
+def test_negotiate_accept_language_sep_and_case():
+    # Case is ignored; the original available identifier is returned.
+    assert core.negotiate_accept_language('FR-ca', ['fR_cA']) == 'fR_cA'
+    # A different separator can be specified for the available identifiers.
+    assert core.negotiate_accept_language('zh-Hant-TW', ['zh-Hant-TW'], sep='-') == 'zh-Hant-TW'
+    # Modifiers on available identifiers are ignored for matching.
+    assert core.negotiate_accept_language('it-IT', ['it_IT@euro']) == 'it_IT@euro'
+
+
+def test_negotiate_accept_language_no_side_effects(monkeypatch):
+    # The caller's list of available locales is not modified.
+    available = ['fr_FR', 'en_US', 'de_DE']
+    assert core.negotiate_accept_language('de, en', available) == 'de_DE'
+    assert available == ['fr_FR', 'en_US', 'de_DE']
+    # The system default locale is never consulted.
+    for name in ['LANGUAGE', 'LANG', 'LC_ALL', 'LC_CTYPE', 'LC_MESSAGES']:
+        monkeypatch.setenv(name, 'de_DE.UTF-8')
+    assert core.negotiate_accept_language('fr', ['fr_FR', 'de_DE']) == 'fr_FR'
+    assert core.negotiate_accept_language('ja', ['fr_FR', 'de_DE']) is None
+
+
 def test_parse_locale():
     assert core.parse_locale('zh_CN') == ('zh', 'CN', None, None)
     assert core.parse_locale('zh_Hans_CN') == ('zh', 'CN', 'Hans', None)

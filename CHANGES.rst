@@ -1,6 +1,17 @@
 Babel Changelog
 ===============
 
+Unreleased
+----------
+
+Features
+~~~~~~~~
+
+* Core: Add ``babel.core.parse_accept_language()`` and
+  ``babel.core.negotiate_accept_language()`` for negotiating HTTP
+  ``Accept-Language`` headers against the available locales, with
+  RFC 4647 lookup fallback, quality values and q=0 exclusions.
+
 Version 2.18.0
 --------------
 

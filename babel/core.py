@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import re
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -25,7 +26,9 @@ __all__ = [
     'get_cldr_version',
     'get_global',
     'get_locale_identifier',
+    'negotiate_accept_language',
     'negotiate_locale',
+    'parse_accept_language',
     'parse_locale',
 ]
 
@@ -1236,6 +1239,228 @@ def negotiate_locale(
         if len(parts) > 1 and parts[0].lower() in available:
             return parts[0]
     return None
+
+
+# A single item of an Accept-Language header: a basic language range
+# (RFC 4647) with an optional quality value (RFC 7231).
+_ACCEPT_LANGUAGE_ITEM_RE = re.compile(
+    r"\s*(?P<range>\*|[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*)"
+    r"(?:\s*;\s*[Qq]=(?P<qvalue>0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?))?\s*",
+)
+
+
+def parse_accept_language(header: str | None) -> list[tuple[str, float]]:
+    """Parse an HTTP ``Accept-Language`` header into a list of
+    ``(language_range, quality)`` tuples.
+
+    The tuples are returned in the order the ranges appear in the header;
+    ranges without an explicit quality value get the default quality of 1.
+
+    >>> parse_accept_language('fr-CA, fr;q=0.8, en;q=0.6, *;q=0')
+    [('fr-CA', 1.0), ('fr', 0.8), ('en', 0.6), ('*', 0.0)]
+
+    Quality values must be between 0 and 1 with at most three decimal
+    places; out-of-range weights and other malformed items are rejected:
+
+    >>> parse_accept_language('en;q=1.5')
+    Traceback (most recent call last):
+      ...
+    ValueError: 'en;q=1.5' is not a valid Accept-Language list item
+
+    An empty (or missing) header yields an empty list:
+
+    >>> parse_accept_language('')
+    []
+
+    .. versionadded:: 2.19
+
+    :param header: the value of an ``Accept-Language`` header, or `None`
+    :raise `ValueError`: if a list item is not a valid language range with
+                         an optional quality value
+    """
+    if header is None:
+        return []
+    if not isinstance(header, str):
+        raise TypeError(f"expected a string or None, got {type(header).__name__!r}")
+    ranges = []
+    for item in header.split(","):
+        item = item.strip()
+        if not item:
+            # Empty list elements are permitted by RFC 7230 and ignored.
+            continue
+        match = _ACCEPT_LANGUAGE_ITEM_RE.fullmatch(item)
+        if match is None:
+            raise ValueError(f"{item!r} is not a valid Accept-Language list item")
+        qvalue = match.group("qvalue")
+        ranges.append((match.group("range"), 1.0 if qvalue is None else float(qvalue)))
+    return ranges
+
+
+def _split_language_tag_subtags(identifier: str, sep: str) -> tuple[str, ...]:
+    """Split a locale identifier or language tag into lowercase subtags.
+
+    Any "@modifier" and ".encoding" suffixes are removed first, mirroring
+    :func:`parse_locale`.  Unlike :func:`parse_locale`, any number of
+    trailing subtags (variants, extensions, private use) is tolerated.
+    """
+    identifier = identifier.partition("@")[0].partition(".")[0]
+    return tuple(identifier.lower().split(sep))
+
+
+def _tag_script(subtags: tuple[str, ...]) -> str | None:
+    """Return the script subtag of a split language tag, if it has one."""
+    if len(subtags) > 1 and len(subtags[1]) == 4 and subtags[1].isalpha():
+        return subtags[1]
+    return None
+
+
+def _match_specificity(
+    range_subtags: tuple[str, ...], available_subtags: tuple[str, ...]
+) -> int:
+    """Return how specifically a language range matches an available locale.
+
+    The result is the number of leading subtags the range and the locale
+    identifier have in common, following the subtag fallback of the
+    RFC 4647 "lookup" scheme; it is -1 if the range does not match at all.
+
+    A range that declares a script never matches a locale that declares a
+    different script, so that e.g. "zh-Hant" cannot fall back to "zh_Hans".
+    """
+    range_script = _tag_script(range_subtags)
+    available_script = _tag_script(available_subtags)
+    if (
+        range_script is not None
+        and available_script is not None
+        and range_script != available_script
+    ):
+        return -1
+    length = 0
+    for range_subtag, available_subtag in zip(range_subtags, available_subtags):
+        if range_subtag != available_subtag:
+            break
+        length += 1
+    return length if length > 0 else -1
+
+
+def negotiate_accept_language(
+    header: str | None,
+    available: Iterable[str],
+    sep: str = '_',
+    aliases: Mapping[str, str] | None = LOCALE_ALIASES,
+) -> str | None:
+    """Find the best match between an HTTP ``Accept-Language`` header and
+    the available locale strings, and return the matching identifier from
+    `available` unchanged, or `None` if there is no acceptable match.
+
+    >>> negotiate_accept_language('fr-CA, fr;q=0.8, en;q=0.6, *;q=0',
+    ...                           ['fr_FR', 'fr_CA', 'en_US'])
+    'fr_CA'
+
+    Matching follows the subtag fallback of the RFC 4647 "lookup" scheme,
+    so a range matches an available locale if either one is a more specific
+    version of the other:
+
+    >>> negotiate_accept_language('de-CH', ['de', 'en'])
+    'de'
+    >>> negotiate_accept_language('de', ['de_DE', 'en_US'])
+    'de_DE'
+
+    Each available locale is governed by the most specific range that
+    matches it.  This applies to exclusions (a quality of 0) as well: an
+    explicitly allowed locale is not rejected by a broader exclusion, and
+    an explicitly excluded locale cannot be resurrected by a broader range
+    or the wildcard:
+
+    >>> negotiate_accept_language('fr;q=0, fr-CA;q=0.5', ['fr_CA', 'fr_FR'])
+    'fr_CA'
+    >>> negotiate_accept_language('fr-CA;q=0, fr;q=0.8, *;q=0.5', ['fr_CA', 'fr_FR'])
+    'fr_FR'
+
+    Matches are ordered by quality value; ties are broken by the order of
+    the ranges in the header (the first occurrence of a duplicated range
+    wins), then by the specificity of the match, and finally by the order
+    of the `available` list:
+
+    >>> negotiate_accept_language('en;q=0.5, fr;q=0.5', ['fr_FR', 'en_US'])
+    'en_US'
+
+    A range that declares a script never falls back to a locale with a
+    different script:
+
+    >>> negotiate_accept_language('zh-Hant', ['zh_Hans_CN', 'zh_Hant_TW'])
+    'zh_Hant_TW'
+    >>> negotiate_accept_language('zh-Hans', ['zh_Hant_TW']) is None
+    True
+
+    Like :func:`negotiate_locale`, a default mapping of commonly used
+    language-only identifiers is applied, which can be overridden or
+    disabled with the `aliases` parameter:
+
+    >>> negotiate_accept_language('no', ['nb_NO', 'sv_SE'])
+    'nb_NO'
+
+    The `available` list is not modified, and the system default locale is
+    never consulted.  No web framework is required; pass the header value
+    as a string.
+
+    .. versionadded:: 2.19
+
+    :param header: the value of an ``Accept-Language`` header, or `None`
+    :param available: the list of locale strings available
+    :param sep: character that separates the different parts of the
+                `available` locale identifiers
+    :param aliases: a dictionary of aliases for locale identifiers
+    :raise `ValueError`: if the header contains an invalid language range
+                         or quality value
+    """
+    language_ranges = parse_accept_language(header)
+    if not language_ranges:
+        return None
+
+    # Pre-compute the subtag patterns of each range: the range itself plus,
+    # if known, its alias (e.g. "no" -> "nb_NO").  The wildcard needs no
+    # pattern; it matches anything with the lowest possible specificity.
+    parsed_ranges: list[tuple[float, list[tuple[str, ...]]]] = []
+    for language_range, quality in language_ranges:
+        patterns = []
+        if language_range != "*":
+            patterns.append(_split_language_tag_subtags(language_range, "-"))
+            if aliases:
+                alias = aliases.get(language_range.replace("-", "_").lower())
+                if alias:
+                    patterns.append(_split_language_tag_subtags(alias.replace("_", sep), sep))
+        parsed_ranges.append((quality, patterns))
+
+    best: tuple[tuple[float, int, int, int], str] | None = None
+    for available_index, identifier in enumerate(available):
+        if not identifier:
+            continue
+        available_subtags = _split_language_tag_subtags(identifier, sep)
+        # Find the range governing this identifier: the most specific
+        # match wins, with ties broken by the order in the header.
+        winner: tuple[int, int, float] | None = None  # (specificity, -range_index, quality)
+        for range_index, (quality, patterns) in enumerate(parsed_ranges):
+            if not patterns:  # the "*" wildcard
+                specificity = 0
+            else:
+                specificity = max(
+                    (_match_specificity(pattern, available_subtags) for pattern in patterns),
+                    default=-1,
+                )
+            if specificity < 0:
+                continue
+            candidate = (specificity, -range_index, quality)
+            if winner is None or candidate[:2] > winner[:2]:
+                winner = candidate
+        if winner is None:
+            continue
+        specificity, neg_range_index, quality = winner
+        if quality <= 0:
+            continue  # explicitly excluded by a q=0 range
+        key = (-quality, -neg_range_index, -specificity, available_index)
+        if best is None or key < best[0]:
+            best = (key, identifier)
+    return best[1] if best is not None else None
 
 
 def parse_locale(
