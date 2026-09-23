@@ -19,6 +19,7 @@ Features
 * Messages: Merge in per-format keywords and auto_comments by @akx in :gh:`1243`
 * Messages: Update keywords for extraction of dpgettext and dnpgettext by @mardiros in :gh:`1235`
 * Messages: Validate all plurals in Python format checker by @tomasr8 in :gh:`1188`
+* Dates: Add an opt-in strict LDML-based parsing mode to ``parse_date(strict=True)`` that consumes the whole input, matches locale month and weekday names (format vs. stand-alone contexts), rejects ambiguous narrow names and weekdays that do not match the date, reports the failing input position, and explicitly rejects unsupported pattern fields
 * Time: Use standard library `timezone` instead of `FixedOffsetTimezone` by @akx in :gh:`1203`
 
 Bugfixes

@@ -1253,10 +1253,196 @@ class ParseError(ValueError):
     pass
 
 
+# Fields that strict date parsing understands.  Everything else (time of
+# day, time zones, eras, weeks, quarters, ...) is explicitly rejected; in
+# particular time fields and calendar/zone conversions are out of scope.
+_STRICT_YEAR_FIELDS = frozenset('yu')
+_STRICT_SUPPORTED_FIELDS = frozenset('yuMdELce')
+
+_MONTH_WIDTH = {3: 'abbreviated', 4: 'wide', 5: 'narrow'}
+_WEEKDAY_WIDTH = {3: 'abbreviated', 4: 'wide', 5: 'narrow', 6: 'short'}
+
+
+class _StrictParseError(ParseError):
+    """A parse error that knows where in the input parsing failed."""
+
+    # Display as ``babel.dates.ParseError`` in tracebacks and doctests;
+    # subclassing keeps ``isinstance``/``except ParseError`` working.
+    __module__ = ParseError.__module__
+    __qualname__ = ParseError.__name__
+
+    def __init__(self, message: str, pos: int) -> None:
+        super().__init__(f"{message} at position {pos}")
+        self.position = pos
+
+
+def _match_name(
+    string: str,
+    pos: int,
+    names: LocaleDataDict,
+    field: str,
+) -> int:
+    """Match a (month or weekday) name at ``pos``.
+
+    Names are tried longest first, so e.g. a wide name that starts with an
+    abbreviated one cannot mask it.  When the remaining text is ambiguous
+    between several distinct names in ``names``, that is an error too.
+    """
+    candidates = sorted(
+        ((len(name), number, name) for number, name in names.items() if name),
+        reverse=True,
+    )
+    matched = None
+    for length, number, name in candidates:
+        if string.startswith(name, pos):
+            if matched is not None:
+                if number != matched[1]:
+                    raise _StrictParseError(
+                        f"Ambiguous {field} name: {string[pos:pos + length]!r} "
+                        f"matches several {field} names",
+                        pos,
+                    )
+                # Same number as an earlier match: same entity, ignore.
+                continue
+            matched = (length, number, name)
+    if matched is None:
+        raise _StrictParseError(f"Expected a {field} name", pos)
+    return matched[1]
+
+
+def _read_digits(
+    string: str, pos: int, width: int, max_digits: int, field: str,
+) -> tuple[int, int]:
+    """Read an ASCII decimal integer at ``pos``.
+
+    A field width of 2 or more is fixed-width: exactly that many digits are
+    required (as produced by the formatter).  A width of 1 consumes at most
+    ``max_digits`` digits.
+    """
+    end = pos
+    limit = max_digits if width == 1 else width
+    while end < len(string) and end - pos < limit and '0' <= string[end] <= '9':
+        end += 1
+    if end == pos:
+        raise _StrictParseError(f"Expected a {field} number", pos)
+    if width >= 2 and end - pos < width:
+        # Only part of a longer run of digits matched the fixed-width field.
+        raise _StrictParseError(f"Expected a {width}-digit {field} number", pos)
+    return int(string[pos:end]), end
+
+
+def _parse_date_strict(
+    string: str,
+    pattern: str | DateTimePattern,
+    locale: Locale,
+) -> datetime.date:
+    """Strictly parse ``string`` according to an LDML date ``pattern``.
+
+    Unlike :func:`parse_date`, the whole string must be consumed and the
+    locale's own month and weekday names are used (no English fallback).
+    """
+    pattern_string = pattern.pattern if isinstance(pattern, DateTimePattern) else pattern
+    tokens = tokenize_pattern(pattern_string)
+    pos = 0
+    values: dict[str, int] = {}
+    # List of (python weekday, token position) supplied by E/e/c tokens.
+    weekdays: list[tuple[int, int]] = []
+
+    for tok_type, tok_value in tokens:
+        token_start = pos
+        if tok_type == 'chars':
+            literal = tok_value
+            if not string.startswith(literal, pos):
+                raise _StrictParseError(f"Expected literal {literal!r}", pos)
+            pos += len(literal)
+            continue
+
+        fieldchar, fieldnum = tok_value
+        if fieldchar not in _STRICT_SUPPORTED_FIELDS:
+            raise _StrictParseError(
+                f"Unsupported date pattern field {fieldchar!r} in strict mode",
+                pos,
+            )
+
+        if fieldchar in _STRICT_YEAR_FIELDS:
+            year, pos = _read_digits(string, pos, fieldnum, 4, 'year')
+            if fieldnum == 2:
+                year += 2000
+            values['y'] = year
+        elif fieldchar in ('M', 'L'):
+            if fieldnum <= 2:
+                month, pos = _read_digits(string, pos, fieldnum, 2, 'month')
+            else:
+                context = 'format' if fieldchar == 'M' else 'stand-alone'
+                names = get_month_names(_MONTH_WIDTH[fieldnum], context, locale)
+                month = _match_name(string, pos, names, 'month')
+                pos += len(names[month])
+            if not 1 <= month <= 12:
+                raise _StrictParseError(f"Month {month} is out of range", pos)
+            values['M'] = month
+        elif fieldchar == 'd':
+            day, pos = _read_digits(string, pos, fieldnum, 2, 'day')
+            values['d'] = day
+        elif fieldchar in ('E', 'e', 'c'):
+            if fieldchar == 'E':
+                # E1..E3 is the abbreviated name, E4 wide, E5 narrow, E6 short.
+                width = _WEEKDAY_WIDTH[3 if fieldnum < 3 else fieldnum]
+                names = get_day_names(width, 'format', locale)
+                weekday = _match_name(string, pos, names, 'weekday')
+                pos += len(names[weekday])
+            elif fieldnum < 3:
+                # Numeric local day of week; Monday is 1 in CLDR data.
+                if fieldchar == 'c' and fieldnum != 1:
+                    raise _StrictParseError(
+                        f"Unsupported date pattern field {fieldchar!r} with length {fieldnum} "
+                        "in strict mode",
+                        pos,
+                    )
+                local_day, pos = _read_digits(string, pos, fieldnum, 1, 'weekday')
+                if not 1 <= local_day <= 7:
+                    raise _StrictParseError(
+                        f"Weekday {local_day} is out of range", pos,
+                    )
+                weekday = (locale.first_week_day + local_day - 1) % 7
+            else:
+                context = 'stand-alone' if fieldchar == 'c' else 'format'
+                names = get_day_names(_WEEKDAY_WIDTH[fieldnum], context, locale)
+                weekday = _match_name(string, pos, names, 'weekday')
+                pos += len(names[weekday])
+            weekdays.append((weekday, token_start))
+
+    if 'y' not in values:
+        raise _StrictParseError(
+            "Strict pattern is missing the required 'y' (year) field", pos,
+        )
+    # Month and day may be omitted from the pattern; default to the first.
+    values.setdefault('M', 1)
+    values.setdefault('d', 1)
+
+    try:
+        parsed = datetime.date(values['y'], values['M'], values['d'])
+    except ValueError as err:
+        raise _StrictParseError(str(err).capitalize(), pos) from err
+
+    for weekday, weekday_pos in weekdays:
+        if parsed.weekday() != weekday:
+            raise _StrictParseError(
+                f"Weekday does not match the date {parsed.isoformat()}",
+                weekday_pos,
+            )
+
+    if pos != len(string):
+        raise _StrictParseError(
+            f"Unexpected trailing input {string[pos:]!r}", pos,
+        )
+    return parsed
+
+
 def parse_date(
     string: str,
     locale: Locale | str | None = None,
     format: _PredefinedTimeFormat | str = 'medium',
+    strict: bool = False,
 ) -> datetime.date:
     """Parse a date from a string.
 
@@ -1282,13 +1468,39 @@ def parse_date(
     >>> parse_date('01.04.04', locale='de_DE', format='short')
     datetime.date(2004, 4, 1)
 
+    Passing ``strict=True`` opts into strict LDML-based parsing: the input
+    must match the pattern exactly (quoted literals included), the whole
+    string is consumed, and month and weekday names are taken from the
+    locale without falling back to English.  Narrow names that could refer
+    to several months or weekdays are an error, as is a weekday that does
+    not match the rest of the date.  Pattern fields other than the
+    Gregorian year (``y``/``u``), month (``M``/``L``), day (``d``) and
+    weekday (``E``/``e``/``c``) are rejected.
+
+    >>> parse_date('4 mars 2026', format='d MMMM y', locale='fr_FR', strict=True)
+    datetime.date(2026, 3, 4)
+    >>> parse_date('13/04/2026', format='MM/dd/yyyy', locale='en_US', strict=True)
+    Traceback (most recent call last):
+      ...
+    babel.dates.ParseError: Month 13 is out of range at position 2
+
     :param string: the string containing the date
     :param locale: a `Locale` object or a locale identifier
     :param locale: a `Locale` object or a locale identifier. Defaults to the system time locale.
     :param format: the format to use, either an explicit date format,
                    or one of "full", "long", "medium", or "short"
                    (see ``get_time_format``)
+    :param strict: if true, parse strictly according to the LDML pattern
+                   instead of guessing fields from the numbers in the input
     """
+    parsed_locale = Locale.parse(locale or LC_TIME)
+    if strict:
+        if format in ('full', 'long', 'medium', 'short'):
+            pattern = get_date_format(format=format, locale=parsed_locale)
+        else:
+            pattern = parse_pattern(format)
+        return _parse_date_strict(string, pattern, parsed_locale)
+
     numbers = re.findall(r'(\d+)', string)
     if not numbers:
         raise ParseError("No numbers were found in input")

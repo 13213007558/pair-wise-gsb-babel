@@ -663,6 +663,208 @@ def test_parse_date_custom_format():
     assert dates.parse_date('2024-04-01', format='yyyy.dd.mm') == date(2024, 1, 4)
 
 
+@pytest.mark.parametrize('locale, pattern', [
+    ('fr_FR', 'd MMMM y'),
+    ('de_DE', 'EEEE, d. MMMM y'),
+    ('en_US', "EEEE, MMMM d, y"),
+    ('ru_RU', 'EEEE, d MMMM y'),
+    ('fi_FI', "cccc d. MMMM y"),
+    ('ja_JP', 'yyyy年M月d日EEEE'),
+])
+@pytest.mark.parametrize('day', [
+    date(2024, 1, 1),
+    date(2024, 2, 29),  # leap day
+    date(2024, 12, 31),
+])
+def test_parse_date_strict_format_roundtrip(locale, pattern, day):
+    formatted = dates.format_date(day, pattern, locale=locale)
+    assert dates.parse_date(
+        formatted, format=pattern, locale=locale, strict=True,
+    ) == day
+
+
+@pytest.mark.parametrize('locale, predefined', [
+    ('en_US', 'medium'),
+    ('fr_FR', 'long'),
+    ('ru_RU', 'full'),
+    ('de_DE', 'short'),
+])
+def test_parse_date_strict_predefined_format(locale, predefined):
+    day = date(2024, 2, 29)
+    formatted = dates.format_date(day, predefined, locale=locale)
+    assert dates.parse_date(
+        formatted, locale=locale, format=predefined, strict=True,
+    ) == day
+
+
+def test_parse_date_strict_numeric_fields():
+    assert dates.parse_date(
+        '04/03/2026', format='dd/MM/yyyy', strict=True,
+    ) == date(2026, 3, 4)
+    assert dates.parse_date(
+        '4/3/26', format='d/M/yy', strict=True,
+    ) == date(2026, 3, 4)
+    assert dates.parse_date(
+        '2026', format='yyyy', strict=True,
+    ) == date(2026, 1, 1)
+
+
+def test_parse_date_strict_does_not_swap_month_and_day():
+    # The lenient parser swaps this into month 4, day 13; strict must not.
+    assert dates.parse_date('13/04/2026', format='dd/MM/yyyy') == date(2026, 4, 13)
+    with pytest.raises(dates.ParseError) as exc_info:
+        dates.parse_date('13/04/2026', format='MM/dd/yyyy', strict=True)
+    assert exc_info.value.position == 2
+
+
+def test_parse_date_strict_uses_locale_month_names():
+    assert dates.parse_date(
+        '4 mars 2026', format='d MMMM y', locale='fr_FR', strict=True,
+    ) == date(2026, 3, 4)
+    # No English fallback when parsing for a French locale.
+    with pytest.raises(dates.ParseError) as exc_info:
+        dates.parse_date(
+            '4 March 2026', format='d MMMM y', locale='fr_FR', strict=True,
+        )
+    assert exc_info.value.position == 2
+
+
+def test_parse_date_strict_russian_month_forms():
+    # M uses the format (genitive) context, L the stand-alone context.
+    assert dates.parse_date(
+        '4 марта 2026', format='d MMMM y', locale='ru_RU', strict=True,
+    ) == date(2026, 3, 4)
+    assert dates.parse_date(
+        'март 2026', format='LLLL y', locale='ru_RU', strict=True,
+    ) == date(2026, 3, 1)
+    with pytest.raises(dates.ParseError):
+        dates.parse_date(
+            '4 март 2026', format='d MMMM y', locale='ru_RU', strict=True,
+        )
+
+
+def test_parse_date_strict_ambiguous_narrow_month():
+    # In French narrow month data, 'M' is both March and May.
+    with pytest.raises(dates.ParseError) as exc_info:
+        dates.parse_date(
+            'M 2026', format='MMMMM y', locale='fr_FR', strict=True,
+        )
+    assert exc_info.value.position == 0
+    # Unambiguous narrow names still parse.
+    assert dates.parse_date(
+        'F 2026', format='MMMMM y', locale='fr_FR', strict=True,
+    ) == date(2026, 2, 1)
+
+
+def test_parse_date_strict_weekday_names():
+    assert dates.parse_date(
+        'Wednesday 2026-03-04', format='EEEE yyyy-MM-dd',
+        locale='en_US', strict=True,
+    ) == date(2026, 3, 4)
+    assert dates.parse_date(
+        'Wed 2026-03-04', format='EEE yyyy-MM-dd',
+        locale='en_US', strict=True,
+    ) == date(2026, 3, 4)
+    assert dates.parse_date(
+        'We 2026-03-04', format='EEEEEE yyyy-MM-dd',
+        locale='en_US', strict=True,
+    ) == date(2026, 3, 4)
+    # Narrow 'T' matches both Tuesday and Thursday.
+    with pytest.raises(dates.ParseError) as exc_info:
+        dates.parse_date(
+            'T 2026-03-03', format='EEEEE yyyy-MM-dd',
+            locale='en_US', strict=True,
+        )
+    assert exc_info.value.position == 0
+
+
+def test_parse_date_strict_weekday_must_match_date():
+    with pytest.raises(dates.ParseError) as exc_info:
+        dates.parse_date(
+            'Monday 2026-03-04', format='EEEE yyyy-MM-dd',
+            locale='en_US', strict=True,
+        )
+    assert exc_info.value.position == 0
+    # Numeric local weekday (Sunday is day 1 in en_US) must match as well.
+    with pytest.raises(dates.ParseError):
+        dates.parse_date(
+            '2 2026-03-08', format='e yyyy-MM-dd',
+            locale='en_US', strict=True,
+        )
+    assert dates.parse_date(
+        '1 2026-03-08', format='e yyyy-MM-dd',
+        locale='en_US', strict=True,
+    ) == date(2026, 3, 8)
+
+
+def test_parse_date_strict_quoted_literals():
+    pattern = "yyyy'y'MM'M'dd'd'"
+    formatted = dates.format_date(date(2024, 2, 29), pattern, locale='en_US')
+    assert formatted == "2024y02M29d"
+    assert dates.parse_date(
+        formatted, format=pattern, locale='en_US', strict=True,
+    ) == date(2024, 2, 29)
+    # A doubled single quote is a literal quote.
+    assert dates.parse_date(
+        "2026 o'clock 03 04", format="yyyy 'o''clock' MM dd",
+        strict=True,
+    ) == date(2026, 3, 4)
+    with pytest.raises(dates.ParseError) as exc_info:
+        dates.parse_date(
+            '2024x02M29d', format=pattern, locale='en_US', strict=True,
+        )
+    assert exc_info.value.position == 4
+
+
+def test_parse_date_strict_unicode_whitespace():
+    pattern = "yyyy'\u00a0'MM'\u202f'dd"
+    assert dates.parse_date(
+        '2026\u00a003\u202f04', format=pattern, strict=True,
+    ) == date(2026, 3, 4)
+    # ASCII whitespace is not an NBSP.
+    with pytest.raises(dates.ParseError) as exc_info:
+        dates.parse_date('2026 03 04', format=pattern, strict=True)
+    assert exc_info.value.position == 4
+
+
+def test_parse_date_strict_invalid_dates():
+    # Leap day in a non-leap year.
+    with pytest.raises(dates.ParseError) as exc_info:
+        dates.parse_date('2023-02-29', format='yyyy-MM-dd', strict=True)
+    assert exc_info.value.position == 10
+    with pytest.raises(dates.ParseError):
+        dates.parse_date('2026-00-01', format='yyyy-MM-dd', strict=True)
+    with pytest.raises(dates.ParseError):
+        dates.parse_date('2026-01-32', format='yyyy-MM-dd', strict=True)
+
+
+def test_parse_date_strict_consumes_whole_input():
+    with pytest.raises(dates.ParseError) as exc_info:
+        dates.parse_date('2026-03-04x', format='yyyy-MM-dd', strict=True)
+    assert "trailing" in str(exc_info.value)
+    assert exc_info.value.position == 10
+
+
+@pytest.mark.parametrize('pattern', [
+    'yyyy QQQ',       # quarter
+    'yyyy ww',        # week of year
+    'yyyy DDD',       # day of year
+    'yyyy-MM-dd G',   # era
+    'yyyy-MM-dd HH',  # hour (time field)
+    'yyyy-MM-dd z',   # time zone
+    'yyyy-MM-dd F',   # day of week in month
+])
+def test_parse_date_strict_rejects_unsupported_fields(pattern):
+    with pytest.raises(dates.ParseError):
+        dates.parse_date('whatever', format=pattern, strict=True)
+
+
+def test_parse_date_strict_requires_year():
+    with pytest.raises(dates.ParseError) as exc_info:
+        dates.parse_date('mars', format='MMMM', locale='fr_FR', strict=True)
+    assert exc_info.value.position == len('mars')
+
+
 @pytest.mark.parametrize('input, expected', [
     # base case, fully qualified time
     ('15:30:00', time(15, 30)),
