@@ -155,6 +155,37 @@ def test_parse_keywords_with_t():
     }
 
 
+def test_parse_keywords_with_named_parameters():
+    kw = frontend.parse_keywords([
+        'ngettext:1=singular,2=plural',
+        'pgettext:1c=msgctxt,2=message',
+        'lngettext:singular,plural',
+        'lpgettext:msgctxt:c,message',
+    ])
+    assert kw == {
+        'ngettext': ((1, 'singular'), (2, 'plural')),
+        'pgettext': ((1, 'msgctxt', 'c'), (2, 'message')),
+        'lngettext': ('singular', 'plural'),
+        'lpgettext': (('msgctxt', 'c'), 'message'),
+    }
+
+
+def test_extract_messages_with_named_parameters():
+    content = rb"""
+msg1 = ngettext("file", "files", count)
+msg2 = ngettext(n=count, plural="files", singular="file")
+msg3 = npgettext(msgctxt="menu", singular="file", plural="files", n=count)
+"""
+    kw = frontend.parse_keywords(['ngettext:1=singular,2=plural',
+                                  'npgettext:1c=msgctxt,2=singular,3=plural'])
+    result = list(extract.extract("python", BytesIO(content), kw))
+    assert result == [
+        (2, ('file', 'files'), [], None),
+        (3, ('file', 'files'), [], None),
+        (4, ('file', 'files'), [], 'menu'),
+    ]
+
+
 def test_extract_messages_with_t():
     content = rb"""
 _("1 arg, arg 1")

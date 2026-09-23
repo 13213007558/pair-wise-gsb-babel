@@ -147,6 +147,18 @@ The meaning of ``--keyword`` values is as follows:
   context strings. For that, append "c" to the argument index. For example:
   ``pgettext:1c,2``.
 
+- When extracting from Python code, you may also declare the names of the
+  parameters that carry translatable strings, so that calls passing them
+  as keyword arguments are matched as well.  Append ``=name`` to an
+  argument index to designate the parameter ``name`` which is also the
+  given positional parameter; for example, ``ngettext:1=singular,2=plural``
+  matches both ``ngettext("file", "files", n)`` and
+  ``ngettext(n=n, plural="files", singular="file")``.  A bare parameter
+  name (such as ``ngettext:singular,plural``) only matches keyword
+  arguments, and context parameters may be named as well, either with
+  ``Nc=name`` (e.g. ``pgettext:1c=msgctxt,2=message``) or with the
+  suffix ``:c`` on a bare name (e.g. ``pgettext:msgctxt:c,message``).
+
 - In C++ and Python, you may have functions that behave differently
   depending on how many arguments they take. For this use case, you can
   add an integer followed by "t" after the colon. In this case, the

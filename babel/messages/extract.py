@@ -60,20 +60,38 @@ if TYPE_CHECKING:
         def seek(self, __offset: int, __whence: int = ...) -> int: ...
         def tell(self) -> int: ...
 
-    _SimpleKeyword: TypeAlias = tuple[int | tuple[int, int] | tuple[int, str], ...] | None
+    # A keyword specification entry designates one parameter of a translation
+    # function and may be:
+    # * an integer `n`: the nth positional argument is a message,
+    # * a string `name`: the keyword argument `name` is a message,
+    # * a tuple `(n, 'c')` or `(name, 'c')`: the designated argument is
+    #   a context string,
+    # * a tuple `(n, name)`: the parameter called `name` (the nth
+    #   positional parameter) is a message, however it is passed,
+    # * a tuple `(n, name, 'c')`: like above, but a context string.
+    _KeywordSpecEntry: TypeAlias = int | str | tuple[int | str, str] | tuple[int, str, str]
+    _SimpleKeyword: TypeAlias = tuple[_KeywordSpecEntry, ...] | None
     _Keyword: TypeAlias = dict[int | None, _SimpleKeyword] | _SimpleKeyword
 
     # 5-tuple of (filename, lineno, messages, comments, context)
     _FileExtractionResult: TypeAlias = tuple[str, int, str | tuple[str, ...], list[str], str | None]  # fmt: skip
 
     # 4-tuple of (lineno, message, comments, context)
-    _ExtractionResult: TypeAlias = tuple[int, str | tuple[str, ...], list[str], str | None]
+    _ExtractionResult: TypeAlias = tuple[int, str | tuple[str, ...], list[str], str | None]  # fmt: skip
+
+    # Extractors yield 4-tuples of (lineno, funcname, messages, comments).
+    # Extractors that understand keyword arguments may instead yield 5-tuples
+    # of (lineno, funcname, messages, comments, keyword_arguments), where
+    # keyword_arguments maps parameter names to their static values (or None
+    # if the value cannot be determined statically).
+    _ExtractorYield: TypeAlias = tuple[int, str, Any, list[str]] | tuple[int, str, Any, list[str], dict[str, str | None]]  # fmt: skip
 
     # Required arguments: fileobj, keywords, comment_tags, options
-    # Return value: Iterable of (lineno, message, comments, context)
+    # Return value: Iterable of (lineno, funcname, messages, comments) tuples,
+    # optionally with a fifth element for keyword arguments
     _CallableExtractionMethod: TypeAlias = Callable[
         [_FileObj | IO[bytes], Mapping[str, _Keyword], Collection[str], Mapping[str, Any]],
-        Iterable[_ExtractionResult],
+        Iterable[_ExtractorYield],
     ]  # fmt: skip
 
     _ExtractionMethod: TypeAlias = _CallableExtractionMethod | str
@@ -384,38 +402,99 @@ def extract_from_file(
         )
 
 
+def _lookup_argument(
+    ref: int | str,
+    messages: list[str | None],
+    keyword_messages: Mapping[str, str | None] | None,
+) -> str | None:
+    """Look up a single argument by 1-based position or parameter name."""
+    if isinstance(ref, str):
+        # A parameter name: only matches keyword arguments.
+        if not keyword_messages:
+            return None
+        return keyword_messages.get(ref)
+    # A 1-based positional argument index.
+    if not 1 <= ref <= len(messages):
+        return None
+    return messages[ref - 1]
+
+
+def _lookup_named_argument(
+    position: int,
+    name: str,
+    messages: list[str | None],
+    keyword_messages: Mapping[str, str | None] | None,
+) -> str | None:
+    """Look up a parameter that may be passed positionally or by keyword."""
+    keyword_messages = keyword_messages or {}
+    position_bound = 1 <= position <= len(messages)
+    name_bound = name in keyword_messages
+    if position_bound and name_bound:
+        # The call binds the same parameter both positionally and by
+        # keyword; it would fail at runtime, so its value cannot be
+        # determined statically.
+        return None
+    if name_bound:
+        return keyword_messages[name]
+    if position_bound:
+        return messages[position - 1]
+    return None
+
+
+def _resolve_spec_entry(
+    entry: int | str | tuple,
+    messages: list[str | None],
+    keyword_messages: Mapping[str, str | None] | None,
+) -> tuple[str | None, bool]:
+    """Resolve a keyword specification entry to an argument value.
+
+    Returns a tuple of ``(value, is_context)``; a value of None means the
+    argument cannot be determined statically.
+    """
+    if isinstance(entry, tuple):
+        if len(entry) == 2:
+            ref, marker = entry
+            if marker == 'c':
+                # (n, 'c') or (name, 'c'): context
+                return _lookup_argument(ref, messages, keyword_messages), True
+            # (n, name): a parameter that may be passed either positionally
+            # (as the nth argument) or by keyword
+            return _lookup_named_argument(ref, marker, messages, keyword_messages), False
+        if len(entry) == 3:
+            # (n, name, 'c'): context from a positional-or-keyword parameter
+            ref, name, _ = entry
+            return _lookup_named_argument(ref, name, messages, keyword_messages), True
+        raise ValueError(f"Invalid keyword specification entry: {entry!r}")
+    return _lookup_argument(entry, messages, keyword_messages), False
+
+
 def _match_messages_against_spec(
     lineno: int,
     messages: list[str | None],
     comments: list[str],
     fileobj: _FileObj,
-    spec: tuple[int | tuple[int, str], ...],
+    spec: tuple[int | str | tuple, ...],
+    keyword_messages: Mapping[str, str | None] | None = None,
 ):
     translatable = []
     context = None
+    first_msgid = None
 
-    # last_index is 1 based like the keyword spec
-    last_index = len(messages)
-    for index in spec:
-        if isinstance(index, tuple):  # (n, 'c')
-            context = messages[index[0] - 1]
+    for entry in spec:
+        value, is_context = _resolve_spec_entry(entry, messages, keyword_messages)
+        if is_context:
+            context = value
             continue
-        if last_index < index:
-            # Not enough arguments
+        if value is None:
+            # The argument is missing or cannot be determined statically;
+            # this call does not match the specification.
             return
-        message = messages[index - 1]
-        if message is None:
-            return
-        translatable.append(message)
+        if first_msgid is None:
+            first_msgid = value
+        translatable.append(value)
 
-    # keyword spec indexes are 1 based, therefore '-1'
-    if isinstance(spec[0], tuple):
-        # context-aware *gettext method
-        first_msg_index = spec[1] - 1
-    else:
-        first_msg_index = spec[0] - 1
     # An empty string msgid isn't valid, emit a warning
-    if not messages[first_msg_index]:
+    if not first_msgid:
         filename = getattr(fileobj, "name", None) or "(unknown)"
         sys.stderr.write(
             f"{filename}:{lineno}: warning: Empty msgid.  It is reserved by GNU gettext: gettext(\"\") "
@@ -506,10 +585,17 @@ def extract(
 
     results = func(fileobj, keywords.keys(), comment_tags, options=options or {})
 
-    for lineno, funcname, messages, comments in results:
+    for result in results:
+        if len(result) == 5:
+            # The extractor supports keyword arguments and reports them
+            # as a fifth tuple element.
+            lineno, funcname, messages, comments, keyword_messages = result
+        else:
+            lineno, funcname, messages, comments = result
+            keyword_messages = None
         if not isinstance(messages, (list, tuple)):
             messages = [messages]
-        if not messages:
+        if not messages and not keyword_messages:
             continue
 
         specs = keywords[funcname] or None if funcname else None
@@ -520,17 +606,20 @@ def extract(
         if strip_comment_tags:
             _strip_comment_tags(comments, comment_tags)
 
+        num_args = len(messages) + len(keyword_messages or ())
         # None matches all arities.
-        for arity in (None, len(messages)):
+        for arity in (None, num_args):
             try:
                 spec = specs[arity]
             except KeyError:
                 continue
             if spec is None:
                 spec = (1,)
-            result = _match_messages_against_spec(lineno, messages, comments, fileobj, spec)
-            if result is not None:
-                yield result
+            matched = _match_messages_against_spec(
+                lineno, messages, comments, fileobj, spec, keyword_messages,
+            )
+            if matched is not None:
+                yield matched
 
 
 def extract_nothing(
@@ -550,11 +639,18 @@ def extract_python(
     keywords: Mapping[str, _Keyword],
     comment_tags: Collection[str],
     options: _PyOptions,
-) -> Generator[_ExtractionResult, None, None]:
+) -> Generator[_ExtractorYield, None, None]:
     """Extract messages from Python source code.
 
     It returns an iterator yielding tuples in the following form ``(lineno,
     funcname, message, comments)``.
+
+    If a function call uses keyword arguments (``name=value``) or star
+    arguments (``*args``/``**kwargs``), the yielded tuple has a fifth
+    element: a dictionary mapping the keyword argument names to their
+    static string values (or None for values that cannot be determined
+    statically).  In that case ``message`` is a tuple of the positional
+    argument values only.
 
     :param fileobj: the seekable, file-like object the messages should be
                     extracted from
@@ -569,9 +665,37 @@ def extract_python(
     call_stack = []  # line numbers of calls
     buf = []
     messages = []
+    kwarg_messages = {}
     translator_comments = []
     in_def = in_translator_comments = False
     comment_tag = None
+    # State for keyword arguments (``name=value``) and star arguments
+    # (``*args``/``**kwargs``) within the call currently being parsed.
+    kwarg_name = None  # name of the keyword argument being parsed, if any
+    pending_name = None  # last plain NAME token; a potential keyword name
+    skip_argument = False  # the current argument is a *args/**kwargs expansion
+    saw_extended_args = False  # the call used keyword or star arguments
+    positional_blocked = False  # positional args can no longer be indexed
+
+    def flush_argument():
+        nonlocal kwarg_name, skip_argument
+        value = ''.join(buf) if buf else None
+        del buf[:]
+        if skip_argument:
+            # A *args or **kwargs expansion; its contents cannot be
+            # determined statically.
+            skip_argument = False
+            return
+        if kwarg_name is not None:
+            if kwarg_name in kwarg_messages:
+                # The same parameter is bound more than once, so its
+                # value cannot be determined.
+                kwarg_messages[kwarg_name] = None
+            else:
+                kwarg_messages[kwarg_name] = value
+            kwarg_name = None
+        elif not positional_blocked:
+            messages.append(value)
 
     encoding = parse_encoding(fileobj) or options.get('encoding', 'UTF-8')
     future_flags = parse_future_flags(fileobj, encoding)
@@ -615,13 +739,12 @@ def extract_python(
         elif funcname and len(call_stack) == 1:
             nested = tok == NAME and value in keywords
             if (tok == OP and value == ')') or nested:
-                if buf:
-                    messages.append(''.join(buf))
-                    del buf[:]
-                else:
-                    messages.append(None)
+                flush_argument()
 
-                messages = tuple(messages) if len(messages) > 1 else messages[0]
+                if saw_extended_args:
+                    messages_result = tuple(messages)
+                else:
+                    messages_result = tuple(messages) if len(messages) > 1 else messages[0]
 
                 if translator_comments:
                     last_comment_lineno = translator_comments[-1][0]
@@ -631,18 +754,31 @@ def extract_python(
                         # to start this message's translation call is.
                         translator_comments.clear()
 
-                yield (
-                    message_lineno,
-                    funcname,
-                    messages,
-                    [comment[1] for comment in translator_comments],
-                )
+                comments = [comment[1] for comment in translator_comments]
+                if saw_extended_args:
+                    yield (
+                        message_lineno,
+                        funcname,
+                        messages_result,
+                        comments,
+                        kwarg_messages,
+                    )
+                else:
+                    yield (
+                        message_lineno,
+                        funcname,
+                        messages_result,
+                        comments,
+                    )
 
                 funcname = lineno = message_lineno = None
                 call_stack.clear()
                 messages = []
+                kwarg_messages = {}
                 translator_comments = []
                 in_translator_comments = False
+                kwarg_name = pending_name = None
+                skip_argument = saw_extended_args = positional_blocked = False
                 if nested:
                     funcname = value
             elif tok == STRING:
@@ -668,11 +804,8 @@ def extract_python(
                         buf.append(val)
 
             elif tok == OP and value == ',':
-                if buf:
-                    messages.append(''.join(buf))
-                    del buf[:]
-                else:
-                    messages.append(None)
+                flush_argument()
+                pending_name = None
                 if translator_comments:
                     # We have translator comments, and since we're on a
                     # comma(,) user is allowed to break into a new line
@@ -680,6 +813,28 @@ def extract_python(
                     # for the comment to still be a valid one
                     old_lineno, old_comment = translator_comments.pop()
                     translator_comments.append((old_lineno + 1, old_comment))
+
+            elif tok == OP and value == '=' and pending_name is not None:
+                # A keyword argument such as `singular="file"`
+                kwarg_name = pending_name
+                pending_name = None
+                saw_extended_args = True
+                positional_blocked = True
+
+            elif tok == OP and value in ('*', '**'):
+                # A *args or **kwargs expansion; the argument cannot be
+                # determined statically, and positional arguments after a
+                # single star cannot be reliably indexed.
+                saw_extended_args = True
+                skip_argument = True
+                pending_name = None
+                if value == '*':
+                    positional_blocked = True
+
+            elif tok == NAME:
+                pending_name = value
+                if not message_lineno:
+                    message_lineno = lineno
 
             elif tok != NL and not message_lineno:
                 message_lineno = lineno
@@ -724,7 +879,7 @@ def extract_javascript(
     comment_tags: Collection[str],
     options: _JSOptions,
     lineno: int = 1,
-) -> Generator[_ExtractionResult, None, None]:
+) -> Generator[_ExtractorYield, None, None]:
     """Extract messages from JavaScript source code.
 
     :param fileobj: the seekable, file-like object the messages should be
@@ -892,7 +1047,7 @@ def parse_template_string(
     comment_tags: Collection[str],
     options: _JSOptions,
     lineno: int = 1,
-) -> Generator[_ExtractionResult, None, None]:
+) -> Generator[_ExtractorYield, None, None]:
     """Parse JavaScript template string.
 
     :param template_string: the template string to be parsed

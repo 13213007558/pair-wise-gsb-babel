@@ -244,6 +244,10 @@ in any mapping section and will be merged with global settings:
   ``keywords = "_ gettext ngettext:1,2"`` or
   ``keywords = ["_", "gettext", "ngettext:1,2"]``
 
+  Parameter names may be declared as well (e.g. ``ngettext:1=singular,2=plural``)
+  so that Python calls passing keyword arguments are matched; see the
+  documentation of the ``--keyword`` command-line option for details.
+
 ``add_comments``
   A list of comment tag prefixes to extract and include in the
   output. This uses the same syntax as the ``--add-comments`` command-line option.

@@ -1239,16 +1239,36 @@ def _parse_mapping_toml(
     return _parse_config_object(babel_data, filename=filename)
 
 
-def _parse_spec(s: str) -> tuple[int | None, tuple[int | tuple[int, str], ...]]:
+def _parse_spec(s: str) -> tuple[int | None, tuple[int | str | tuple, ...]]:
     inds = []
     number = None
     for x in s.split(','):
-        if x[-1] == 't':
-            number = int(x[:-1])
-        elif x[-1] == 'c':
-            inds.append((int(x[:-1]), 'c'))
-        else:
+        if not x:
+            continue
+        if '=' in x:
+            # `N=name` or `Nc=name`: the parameter `name`, which is also the
+            # Nth positional parameter, is a message (or a context string).
+            ref, _, name = x.partition('=')
+            if not name:
+                raise ValueError(f"Invalid keyword specification: {x!r}")
+            if ref.isdigit():
+                inds.append((int(ref), name))
+            elif ref[:-1].isdigit() and ref[-1] == 'c':
+                inds.append((int(ref[:-1]), name, 'c'))
+            else:
+                raise ValueError(f"Invalid keyword specification: {x!r}")
+        elif x.isdigit():
             inds.append(int(x))
+        elif x[-1] == 't' and x[:-1].isdigit():
+            number = int(x[:-1])
+        elif x[-1] == 'c' and x[:-1].isdigit():
+            inds.append((int(x[:-1]), 'c'))
+        elif x.endswith(':c') and len(x) > 2:
+            # `name:c`: the keyword parameter `name` is a context string.
+            inds.append((x[:-2], 'c'))
+        else:
+            # A bare parameter name: matches keyword arguments of that name.
+            inds.append(x)
     return number, tuple(inds)
 
 
@@ -1265,6 +1285,16 @@ def parse_keywords(strings: Iterable[str] = ()):
      'pgettext': ((1, 'c'), 2),
      'polymorphic': {None: (1,), 2: (2,), 3: ((3, 'c'),)}}
 
+    Parameter names may be declared so that keyword arguments are matched
+    as well as positional ones; ``N=name`` designates the parameter ``name``
+    which is the Nth positional parameter, and a bare ``name`` only matches
+    keyword arguments.  Context strings are marked with ``c`` as usual:
+
+    >>> pprint.pprint(parse_keywords(['ngettext:1=singular,2=plural',
+    ...                               'pgettext:1c=msgctxt,2=message']))
+    {'ngettext': ((1, 'singular'), (2, 'plural')),
+     'pgettext': ((1, 'msgctxt', 'c'), (2, 'message'))}
+
     The input keywords are in GNU Gettext style; see :doc:`cmdline` for details.
 
     The output is a dictionary mapping keyword names to a dictionary of specifications.
@@ -1275,16 +1305,24 @@ def parse_keywords(strings: Iterable[str] = ()):
     be ``{None: x}``, i.e., there is only one specification and it matches all argument
     counts, then it is collapsed into just ``x``.
 
-    A specification is either a tuple or None. If a tuple, each element can be either a number
-    ``n``, meaning that the nth argument should be extracted as a message, or the tuple
-    ``(n, 'c')``, meaning that the nth argument should be extracted as context for the
-    messages. A ``None`` specification is equivalent to ``(1,)``, extracting the first
+    A specification is either a tuple or None. If a tuple, each element can be:
+
+    * a number ``n``, meaning that the nth argument should be extracted as a message,
+    * a parameter name, meaning that the keyword argument of that name should be
+      extracted as a message,
+    * a tuple ``(n, name)``, meaning that the parameter ``name`` (the nth positional
+      parameter) should be extracted as a message, whether it is passed positionally
+      or as a keyword argument,
+    * a tuple ``(n, 'c')``, ``(name, 'c')`` or ``(n, name, 'c')``, meaning that the
+      designated argument should be extracted as context for the messages.
+
+    A ``None`` specification is equivalent to ``(1,)``, extracting the first
     argument.
     """
     keywords = {}
     for string in strings:
         if ':' in string:
-            funcname, spec_str = string.split(':')
+            funcname, spec_str = string.split(':', 1)
             number, spec = _parse_spec(spec_str)
         else:
             funcname = string

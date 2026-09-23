@@ -402,12 +402,15 @@ n = ngettext()
 n = ngettext('foo')
 """)
     messages = list(extract.extract_python(buf, ('_', 'ngettext'), [], {}))
-    assert messages[0][2] == ('foo', 'bar')
-    assert messages[1][2] == ('hello', 'there', None)
-    assert messages[2][2] == (None, 'hello', 'there')
-    assert messages[3][2] == (None, None)
-    assert messages[4][2] is None
-    assert messages[5][2] == 'foo'
+    assert messages[0] == (2, '_', ('foo', 'bar'), [])
+    # Keyword arguments are reported separately, in a fifth tuple element
+    assert messages[1] == (3, 'ngettext', ('hello', 'there'), [], {'n': None})
+    # Positional arguments after a keyword argument cannot be indexed
+    assert messages[2] == (4, 'ngettext', (), [], {'n': None})
+    # Star arguments cannot be determined statically
+    assert messages[3] == (5, 'ngettext', (), [], {'n': None})
+    assert messages[4] == (None, 'ngettext', None, [])
+    assert messages[5] == (7, 'ngettext', 'foo', [])
 
 
 def test_utf8_message():
@@ -501,12 +504,11 @@ _('Hello, {0} and {1}!', _('Heungsub'),
 _('Armin'))
 """)
     messages = list(extract.extract_python(buf, ('_',), ['NOTE:'], {}))
-    assert messages[0][2] == ('Hello, {name}!', None)
-    assert messages[0][3] == ['NOTE: First']
+    # The `name=` keyword argument is reported in a fifth tuple element
+    assert messages[0] == (3, '_', ('Hello, {name}!',), ['NOTE: First'], {'name': None})
     assert messages[1][2] == 'Foo Bar'
     assert messages[1][3] == []
-    assert messages[2][2] == ('Hello, {name1} and {name2}!', None)
-    assert messages[2][3] == ['NOTE: Second']
+    assert messages[2] == (6, '_', ('Hello, {name1} and {name2}!',), ['NOTE: Second'], {'name1': None})
     assert messages[3][2] == 'Heungsub'
     assert messages[3][3] == []
     assert messages[4][2] == 'Armin'
@@ -517,3 +519,49 @@ _('Armin'))
     assert messages[6][3] == []
     assert messages[7][2] == 'Armin'
     assert messages[7][3] == []
+
+
+def test_keyword_arguments():
+    buf = BytesIO(b"""\
+msg1 = ngettext(n=count, plural="files", singular="file")
+msg2 = ngettext("file", plural="files", n=count)
+msg3 = ngettext(singular="fi" "le", plural="files", n=count)
+msg4 = ngettext(
+    n=count,
+    plural="files",
+    singular="file",
+)
+""")
+    messages = list(extract.extract_python(buf, ('ngettext',), [], {}))
+    assert messages == [
+        (1, 'ngettext', (), [], {'n': None, 'plural': 'files', 'singular': 'file'}),
+        (2, 'ngettext', ('file',), [], {'plural': 'files', 'n': None}),
+        # Adjacent strings are concatenated
+        (3, 'ngettext', (), [], {'singular': 'file', 'plural': 'files', 'n': None}),
+        # Parenthesized calls spanning multiple lines keep the line number
+        # of the first argument
+        (5, 'ngettext', (), [], {'n': None, 'plural': 'files', 'singular': 'file'}),
+    ]
+
+
+def test_keyword_arguments_with_comments():
+    buf = BytesIO(b"""\
+# TRANSLATORS: shown in the file menu
+msg = ngettext(
+    n=count,
+    plural="files",
+    singular="file",
+)
+""")
+    messages = list(extract.extract_python(
+        buf, ('ngettext',), ['TRANSLATORS:'], {},
+    ))
+    assert messages == [
+        (
+            3,
+            'ngettext',
+            (),
+            ['TRANSLATORS: shown in the file menu'],
+            {'n': None, 'plural': 'files', 'singular': 'file'},
+        ),
+    ]
