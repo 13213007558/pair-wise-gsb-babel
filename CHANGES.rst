@@ -1,6 +1,25 @@
 Babel Changelog
 ===============
 
+Version 2.19.0
+--------------
+
+(Unreleased)
+
+Features
+~~~~~~~~
+
+* Units: Add `babel.units.format_unit_list()` for formatting a list of unit values
+  using the locale's list patterns
+
+Bugfixes
+~~~~~~~~
+
+* Lists: Missing "two"/"start"/"middle"/"end" list patterns are now inherited
+  from fallback list styles
+* Units: `format_compound_unit()` now raises `UnknownUnitError` for an unknown
+  denominator unit instead of falling back to an arbitrary unit
+
 Version 2.18.0
 --------------
 

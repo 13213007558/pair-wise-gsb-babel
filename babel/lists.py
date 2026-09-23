@@ -132,10 +132,19 @@ _style_fallbacks = {
 
 
 def _resolve_list_style(locale: Locale, style: str):
+    patterns: dict[str, str] = {}
     for style in (style, *(_style_fallbacks.get(style, []))):  # noqa: B020
         if style in locale.list_patterns:
-            return locale.list_patterns[style]
-    raise ValueError(
-        f"Locale {locale} does not support list formatting style {style!r} "
-        f"(supported are {sorted(locale.list_patterns)})",
-    )
+            # Merge in patterns from the style, letting more specific
+            # styles take precedence over their fallbacks.  This allows
+            # e.g. a locale-specific "unit-short" style that only defines
+            # "start"/"middle"/"end" to inherit the "2" pattern from
+            # the less specific "standard" style.
+            for key, pattern in locale.list_patterns[style].items():
+                patterns.setdefault(key, pattern)
+    if not patterns:
+        raise ValueError(
+            f"Locale {locale} does not support list formatting style {style!r} "
+            f"(supported are {sorted(locale.list_patterns)})",
+        )
+    return patterns

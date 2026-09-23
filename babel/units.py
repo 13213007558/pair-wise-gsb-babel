@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import decimal
+from collections.abc import Iterable
 from typing import Literal
 
 from babel.core import Locale
+from babel.lists import format_list
 from babel.numbers import LC_NUMERIC, format_decimal
 
 
@@ -320,11 +322,13 @@ def format_compound_unit(
     if isinstance(denominator_value, str):  # Denominator is preformatted
         formatted_denominator = denominator_value
     elif denominator_unit:  # Denominator has unit
+        resolved_denominator_unit = _find_unit_pattern(denominator_unit, locale=locale)
+        if not resolved_denominator_unit:
+            raise UnknownUnitError(unit=denominator_unit, locale=locale)
         if denominator_value == 1:  # support perUnitPatterns when the denominator is 1
-            denominator_unit = _find_unit_pattern(denominator_unit, locale=locale)
             per_pattern = (
                 locale._data["unit_patterns"]
-                .get(denominator_unit, {})
+                .get(resolved_denominator_unit, {})
                 .get(length, {})
                 .get("per")
             )
@@ -337,7 +341,7 @@ def format_compound_unit(
 
         formatted_denominator = format_unit(
             denominator_value,
-            measurement_unit=(denominator_unit or ""),
+            measurement_unit=resolved_denominator_unit,
             length=length,
             format=format,
             locale=locale,
@@ -360,3 +364,90 @@ def format_compound_unit(
     )
 
     return per_pattern.format(formatted_numerator, formatted_denominator)
+
+
+def format_unit_list(
+    values: Iterable[tuple[str | float | decimal.Decimal, str]],
+    length: Literal["short", "long", "narrow"] = "long",
+    format: str | None = None,
+    locale: Locale | str | None = None,
+    *,
+    numbering_system: Literal["default"] | str = "latn",
+) -> str:
+    """
+    Format a list of unit values into a localized list.
+
+    Each item in `values` is a `(value, measurement_unit)` tuple,
+    formatted as with `format_unit`, and the resulting strings are
+    joined into a list following the locale's list patterns for units
+    (i.e. the "two"/"start"/"middle"/"end" patterns, not a hard-coded
+    separator).
+
+    Each value is pluralized independently:
+
+    >>> format_unit_list([(1, "length-foot"), (2, "length-inch")], locale="en")
+    '1 foot, 2 inches'
+
+    >>> format_unit_list([(1, "length-foot"), (2, "length-inch"), (3, "length-mile")], locale="en")
+    '1 foot, 2 inches, 3 miles'
+
+    The `length` parameter selects both the unit display width and the
+    corresponding list pattern style:
+
+    >>> format_unit_list([(3, "length-foot"), (2, "length-inch")], length="narrow", locale="en")
+    '3′ 2″'
+
+    >>> format_unit_list([(3, "length-foot"), (2, "length-inch")], length="short", locale="zh_CN")
+    '3英尺2英寸'
+
+    >>> format_unit_list([(3, "length-foot"), (2, "length-inch")], length="short", locale="ar")
+    '3 قدم و2 بوصة'
+
+    A single value is formatted on its own, and an empty iterable
+    yields an empty string:
+
+    >>> format_unit_list([(20, "temperature-celsius")], locale="en")
+    '20 degrees Celsius'
+
+    >>> format_unit_list([], locale="en")
+    ''
+
+    Unknown units raise exceptions:
+
+    >>> format_unit_list([(15, "length-horse")], locale="fi")
+    Traceback (most recent call last):
+        ...
+    UnknownUnitError: length-horse is not a known unit in fi
+
+    .. versionadded:: 2.19.0
+
+    :param values: an iterable of `(value, measurement_unit)` tuples.
+                   If a value is a string, it is considered preformatted
+                   and no number formatting is applied to it.
+    :param length: The formatting length. "short", "long" or "narrow"
+    :param format: An optional format, as accepted by `format_decimal`.
+    :param locale: the `Locale` object or locale identifier. Defaults to the system numeric locale.
+    :param numbering_system: The numbering system used for formatting number symbols. Defaults to "latn".
+                             The special value "default" will use the default numbering system of the locale.
+    :return: A formatted, localized list of unit values.
+    :raise `UnknownUnitError`: If a unit is not known in the locale.
+    :raise `UnsupportedNumberingSystemError`: If the numbering system is not supported by the locale.
+    """
+    locale = Locale.parse(locale or LC_NUMERIC)
+    formatted_values = [
+        format_unit(
+            value,
+            measurement_unit,
+            length=length,
+            format=format,
+            locale=locale,
+            numbering_system=numbering_system,
+        )
+        for value, measurement_unit in values
+    ]
+    list_style = {
+        "long": "unit",
+        "short": "unit-short",
+        "narrow": "unit-narrow",
+    }[length]
+    return format_list(formatted_values, style=list_style, locale=locale)
