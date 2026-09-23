@@ -41,3 +41,23 @@ def test_no_directory_or_input_file_specified(compile_catalog_cmd):
     compile_catalog_cmd.output_file = 'dummy'
     with pytest.raises(OptionError):
         compile_catalog_cmd.finalize_options()
+
+
+def test_compile_catalog_python_brace_format_check(tmp_path, compile_catalog_cmd):
+    po_dir = tmp_path / 'de_DE' / 'LC_MESSAGES'
+    po_dir.mkdir(parents=True)
+    (po_dir / 'messages.po').write_text('''\
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=utf-8\n"
+
+msgid "Total: {price:{width}.{precision}f}"
+msgstr "Gesamt: {price:{widht}.{precision}f}"
+''', encoding='utf-8')
+    compile_catalog_cmd.directory = str(tmp_path)
+    compile_catalog_cmd.locale = 'de_DE'
+    compile_catalog_cmd.finalize_options()
+    catalogs_and_errors = compile_catalog_cmd._run_domain('messages')
+    all_errors = [error for errors in catalogs_and_errors.values() for _, errors in errors for error in errors]
+    assert len(all_errors) == 1
+    assert "unknown named placeholder 'widht'" in str(all_errors[0])

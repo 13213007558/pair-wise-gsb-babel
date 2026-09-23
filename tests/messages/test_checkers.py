@@ -396,3 +396,155 @@ def test__validate_format_invalid(msgid, msgstr, error):
 ])
 def test__validate_format_valid(msgid, msgstr):
     _validate_format(msgid, msgstr)
+
+
+@pytest.mark.parametrize(('msgid', 'msgstr'), [
+    # nested field typo in the format spec
+    ('{price:{width}.{precision}f}', '{price:{widht}.{precision}f}'),
+    # integer presentation changed to an incompatible one
+    ('{count:d}', '{count:f}'),
+    ('{count:d}', '{count:s}'),
+    # default presentation changed to an explicit incompatible one
+    ('{count}', '{count:d}'),
+    # access path not present in the original
+    ('{user}', '{user.name}'),
+    ('{items[0]}', '{items[1]}'),
+    ('{user.name}', '{user.name.first}'),
+    # unknown named placeholder
+    ('{name}', '{naem}'),
+    # positional placeholders may not be omitted or added
+    ('{0} {1}', '{0}'),
+    ('{0}', '{0} {1}'),
+    # automatic and manual field numbering may not be mixed
+    ('{} {0}', '{} {0}'),
+    ('{0} {}', '{0} {}'),
+    # incompatible conversion flags
+    ('{name!r}', '{name!s}'),
+    # unknown conversion specifier
+    ('{name!x}', '{name!x}'),
+    # unbalanced braces
+    ('{name}', '{name'),
+    # pluralizable messages
+    (('{count:d} file', '{count:d} files'), ('{count:d} Datei', '{count:f} Dateien')),
+    (('{count} file', '{count} files'), ('{count} Datei', '{count} Dateien {bogus}')),
+])
+def test_python_brace_format_invalid(msgid, msgstr):
+    msg = Message(msgid, msgstr)
+    assert 'python-brace-format' in msg.flags
+    with pytest.raises(TranslationError):
+        checkers.python_brace_format(None, msg)
+
+
+@pytest.mark.parametrize(('msgid', 'msgstr'), [
+    ('{name}', '{name}'),
+    # empty translations are skipped
+    ('{name}', ''),
+    (('{count} file', '{count} files'), ('', '')),
+    (('{count} file', '{count} files'), ('{count} Datei', '')),
+    # named placeholders may be reordered and omitted
+    ('{name} {age}', '{age} {name}'),
+    ('{name} {age}', '{name}'),
+    # width and precision changes are fine
+    ('{count:8d}', '{count:12d}'),
+    ('{price:8.2f}', '{price:12.4f}'),
+    # compatible presentation types
+    ('{count:d}', '{count:x}'),
+    ('{price:.2f}', '{price:.3g}'),
+    ('{name}', '{name:s}'),
+    # explicit and automatic positional numbering resolve alike
+    ('{} {}', '{1} {0}'),
+    ('{0} {1}', '{} {}'),
+    # positional and named placeholders may be mixed
+    ('{0:d} {name}', '{name} {0:d}'),
+    # attribute and item access paths from the original
+    ('{user.name}', '{user.name}'),
+    ('{items[0].price}', '{items[0].price}'),
+    # conversions
+    ('{name!r}', '{name!r}'),
+    ('{name}', '{name!s}'),
+    # nested fields in the format spec
+    ('{price:{width}.{precision}f}', '{price:{width}.{precision}f}'),
+    ('{price:{width}.{precision}f}', '{price:{precision}.{width}f}'),
+    # doubled braces are literals
+    ('{{literal}} {x}', '{{literal}} {x}'),
+    ('{{literal}} {x}', '{x}'),
+])
+def test_python_brace_format_valid(msgid, msgstr):
+    msg = Message(msgid, msgstr)
+    checkers.python_brace_format(None, msg)
+
+
+def test_python_brace_format_not_flagged():
+    # Messages not flagged as python-brace-format are not checked,
+    # even if the translation contains braces.
+    msg = Message('plain text', '{not: a format string')
+    assert 'python-brace-format' not in msg.flags
+    checkers.python_brace_format(None, msg)
+
+
+def test_python_brace_format_plural_msgstr_location():
+    msg = Message(
+        ('{count} file', '{count} files'),
+        ('{count} Datei', '{count} Dateien {bogus}'),
+    )
+    with pytest.raises(TranslationError, match=r"^msgstr\[1\]: unknown named placeholder 'bogus'$"):
+        checkers.python_brace_format(None, msg)
+
+
+def test_python_brace_format_nested_field_location():
+    msg = Message('{price:{width}.{precision}f}', '{price:{widht}.{precision}f}')
+    with pytest.raises(
+        TranslationError,
+        match=r"unknown named placeholder 'widht' \(nested in the format spec of 'price'\)",
+    ):
+        checkers.python_brace_format(None, msg)
+
+
+@pytest.mark.parametrize(('msgid', 'msgstr', 'error'), [
+    ('{price:{width}.{precision}f}', '{price:{widht}.{precision}f}',
+     r"unknown named placeholder 'widht' \(nested in the format spec of 'price'\)"),
+    ('{0:8d}', '{0:8f}',
+     r"incompatible format for placeholder '0': 'f' and 'd' are not compatible"),
+    ('{user}', '{user.name}', r"unknown named placeholder 'user\.name'"),
+    ('{0} {1}', '{0}', r'positional format placeholders are unbalanced'),
+    ('{} {0}', '{} {0}',
+     r'cannot switch from automatic field numbering to manual field specification'),
+    ('{0} {}', '{0} {}',
+     r'cannot switch from manual field specification to automatic field numbering'),
+    ('{name!r}', '{name!a}',
+     r"incompatible conversion for placeholder 'name': 'a' and 'r' are not compatible"),
+    ('{name!y}', '{name!y}', r"unknown conversion specifier 'y' in field 'name'"),
+    ('{name', '{name', r'invalid brace format string'),
+])
+def test__validate_brace_format_invalid(msgid, msgstr, error):
+    with pytest.raises(TranslationError, match=error):
+        checkers._validate_brace_format(msgid, msgstr)
+
+
+def test_python_brace_format_catalog_check():
+    # A message read from a PO file is automatically flagged and
+    # reported by Catalog.check().
+    po_file = b'''
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=utf-8\\n"
+
+msgid "Total: {price:{width}.{precision}f}"
+msgstr "Gesamt: {price:{widht}.{precision}f}"
+
+msgid "{count} file"
+msgid_plural "{count} files"
+msgstr[0] "{count} Datei"
+msgstr[1] "{count} Dateien {bogus}"
+'''
+    catalog = read_po(BytesIO(po_file), locale='de_DE')
+    errors = {}
+    for message, message_errors in catalog.check():
+        errors[message.id] = message_errors
+    assert len(errors) == 2
+    singular_errors = errors['Total: {price:{width}.{precision}f}']
+    assert len(singular_errors) == 1
+    assert "unknown named placeholder 'widht'" in str(singular_errors[0])
+    plural_errors = errors[('{count} file', '{count} files')]
+    assert len(plural_errors) == 1
+    assert "msgstr[1]: unknown named placeholder 'bogus'" in str(plural_errors[0])

@@ -1,6 +1,17 @@
 Babel Changelog
 ===============
 
+Unreleased
+----------
+
+Features
+~~~~~~~~
+
+* Messages: Add a `python_brace_format` checker that validates Python brace
+  format strings (``str.format`` style) in translations flagged with
+  ``python-brace-format``, including attribute/item access paths, conversion
+  flags and fields nested in format specs
+
 Version 2.18.0
 --------------
 
