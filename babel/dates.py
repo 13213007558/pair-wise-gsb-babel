@@ -30,11 +30,13 @@ except ModuleNotFoundError:
     import zoneinfo
 
 import datetime
-from collections.abc import Iterable
+import decimal
+from collections.abc import Iterable, Mapping
 
 from babel import localtime
 from babel.core import Locale, default_locale, get_global
 from babel.localedata import LocaleDataDict
+from babel.numbers import format_decimal
 
 if TYPE_CHECKING:
     from typing_extensions import TypeAlias
@@ -1028,6 +1030,213 @@ def format_timedelta(
             return pattern.replace('{0}', str(value))
 
     return ''
+
+
+RELATIVE_TIME_UNITS: tuple[tuple[str, int], ...] = TIMEDELTA_UNITS
+
+#: Default factor that determines at which value the presentation switches
+#: to the next higher unit, applied per unit when the caller does not
+#: provide an explicit threshold.  Mirrors the ``format_timedelta`` default.
+DEFAULT_RELATIVE_TIME_THRESHOLD = decimal.Decimal('0.85')
+
+_RELATIVE_TIME_ROUNDING_MODES = frozenset((
+    decimal.ROUND_CEILING,
+    decimal.ROUND_DOWN,
+    decimal.ROUND_FLOOR,
+    decimal.ROUND_HALF_DOWN,
+    decimal.ROUND_HALF_EVEN,
+    decimal.ROUND_HALF_UP,
+    decimal.ROUND_UP,
+    decimal.ROUND_05UP,
+))
+
+
+def _relative_time_seconds(delta: datetime.timedelta | decimal.Decimal | int | float) -> decimal.Decimal:
+    """Convert *delta* to a number of seconds as an exact Decimal.
+
+    The value is never routed through a binary float, so very large
+    intervals and fractional seconds keep their full precision.
+    """
+    if isinstance(delta, datetime.timedelta):
+        seconds = (
+            decimal.Decimal(delta.days * 86400 + delta.seconds)
+            + decimal.Decimal(delta.microseconds) / decimal.Decimal(10 ** 6)
+        )
+    elif isinstance(delta, decimal.Decimal):
+        seconds = delta
+    elif isinstance(delta, float):
+        # str() gives the shortest decimal representation of the float,
+        # avoiding binary representation noise such as 0.1 -> 0.1000...055.
+        seconds = decimal.Decimal(str(delta))
+    else:
+        seconds = decimal.Decimal(delta)
+    if not seconds.is_finite():
+        raise ValueError('delta must be a finite number of seconds')
+    if seconds == 0:
+        # Normalize negative zero so the direction is always "future".
+        seconds = decimal.Decimal(0)
+    return seconds
+
+
+def _get_relative_time_pattern(
+    locale: Locale,
+    unit: str,
+    format: str,
+    direction: str,
+    plural_form: str,
+) -> str:
+    """Look up a relative time pattern, with an explicit fallback chain.
+
+    Falls back from the length-specific variant (e.g. "hour-narrow") to the
+    default length ("hour"), and from the locale's own data to the CLDR root
+    data, so a missing locale entry never produces an empty result.
+    """
+    keys = (f'{unit}-{format}', unit)
+    datas = [locale._data.get('date_fields', {})]
+    if str(locale) != 'root':
+        datas.append(Locale.parse('root')._data.get('date_fields', {}))
+    for date_fields in datas:
+        for key in keys:
+            rel_patterns = date_fields.get(key)
+            if not rel_patterns:
+                continue
+            patterns = rel_patterns.get(direction)
+            if not patterns:
+                continue
+            pattern = patterns.get(plural_form) or patterns.get('other')
+            if pattern:
+                return pattern
+    raise ValueError(
+        f'No relative time pattern found for unit {unit!r} '
+        f'and locale {locale!r}',
+    )
+
+
+def format_relative_time(
+    delta: datetime.timedelta | decimal.Decimal | int | float,
+    *,
+    format: Literal['narrow', 'short', 'long'] = 'long',
+    thresholds: Mapping[str, decimal.Decimal | int | float | str] | None = None,
+    rounding_mode: str = decimal.ROUND_HALF_EVEN,
+    min_granularity: str = 'second',
+    max_granularity: str = 'year',
+    locale: Locale | str | None = None,
+) -> str:
+    """Return a locale-aware relative time string for a time difference.
+
+    Positive values are rendered as future events, negative values as past
+    events, using the locale's own syntax:
+
+    >>> from datetime import timedelta
+    >>> format_relative_time(timedelta(hours=2), locale='en')
+    'in 2 hours'
+    >>> format_relative_time(timedelta(hours=-2), locale='en')
+    '2 hours ago'
+    >>> format_relative_time(timedelta(hours=2), locale='fr')
+    'dans 2 heures'
+
+    The input may be a ``timedelta`` or a number of seconds as a
+    ``Decimal`` (or ``int``/``float``); the value is never converted
+    through a binary float internally, so very large intervals, negative
+    zero and exact threshold crossings behave deterministically:
+
+    >>> from decimal import Decimal
+    >>> format_relative_time(Decimal('-0'), locale='en')
+    'in 0 seconds'
+    >>> format_relative_time(Decimal('3153600000000'), locale='en')
+    'in 100,000 years'
+
+    The unit is chosen by comparing the value against a per-unit threshold
+    factor; the caller may override any unit's threshold, the rounding mode
+    used to obtain the displayed integer, and the smallest/largest unit
+    that may be selected:
+
+    >>> format_relative_time(timedelta(hours=23), locale='en')
+    'in 1 day'
+    >>> format_relative_time(timedelta(hours=23), thresholds={'day': 1.1}, locale='en')
+    'in 23 hours'
+    >>> format_relative_time(timedelta(minutes=90), rounding_mode='ROUND_DOWN', locale='en')
+    'in 1 hour'
+    >>> format_relative_time(timedelta(days=3), max_granularity='hour', locale='en')
+    'in 72 hours'
+
+    The plural category is always derived from the final displayed value,
+    and the past/future wording comes from the locale's CLDR data.  The
+    ``format`` parameter selects the "long", "short" or "narrow" pattern
+    variant:
+
+    >>> format_relative_time(timedelta(hours=3), format='short', locale='en')
+    'in 3 hr.'
+    >>> format_relative_time(timedelta(hours=3), format='narrow', locale='en')
+    'in 3h'
+
+    If a locale has no data for the requested unit or format, the function
+    falls back to the default length variant and finally to the CLDR root
+    patterns.
+
+    :param delta: a ``timedelta`` object representing the time difference
+                  to format, or the difference in seconds as a ``Decimal``
+                  (``int`` and ``float`` are also accepted)
+    :param format: the pattern variant, one of "long", "short" or "narrow"
+    :param thresholds: optional mapping of unit name ("year", "month",
+                       "week", "day", "hour", "minute", "second") to the
+                       factor at which the presentation switches to that
+                       unit; units not given default to 0.85
+    :param rounding_mode: a rounding mode from the ``decimal`` module used
+                          to round the displayed value to an integer;
+                          defaults to ``ROUND_HALF_EVEN``
+    :param min_granularity: the smallest unit that may be displayed
+    :param max_granularity: the largest unit that may be displayed
+    :param locale: a `Locale` object or a locale identifier. Defaults to the system time locale.
+    """
+    if format not in ('narrow', 'short', 'long'):
+        raise TypeError('Format must be one of "narrow", "short" or "long"')
+    if rounding_mode not in _RELATIVE_TIME_ROUNDING_MODES:
+        raise ValueError(f'Invalid rounding mode: {rounding_mode!r}')
+
+    unit_names = [unit for unit, _ in RELATIVE_TIME_UNITS]
+    if min_granularity not in unit_names:
+        raise ValueError(f'Invalid min_granularity: {min_granularity!r}')
+    if max_granularity not in unit_names:
+        raise ValueError(f'Invalid max_granularity: {max_granularity!r}')
+    units = [
+        (unit, secs)
+        for unit, secs in RELATIVE_TIME_UNITS
+        if unit_names.index(max_granularity) <= unit_names.index(unit) <= unit_names.index(min_granularity)
+    ]
+    if not units:
+        raise ValueError(
+            f'max_granularity {max_granularity!r} is smaller than '
+            f'min_granularity {min_granularity!r}',
+        )
+
+    resolved_thresholds: dict[str, decimal.Decimal] = {}
+    for unit, _ in units:
+        resolved_thresholds[unit] = DEFAULT_RELATIVE_TIME_THRESHOLD
+    for unit, threshold in (thresholds or {}).items():
+        if unit not in unit_names:
+            raise ValueError(f'Invalid threshold unit: {unit!r}')
+        resolved_thresholds[unit] = decimal.Decimal(str(threshold))
+
+    seconds = _relative_time_seconds(delta)
+    direction = 'past' if seconds < 0 else 'future'
+    magnitude = abs(seconds)
+
+    locale = Locale.parse(locale or LC_TIME)
+
+    for unit, secs_per_unit in units:
+        value = magnitude / decimal.Decimal(secs_per_unit)
+        if unit != min_granularity and value < resolved_thresholds[unit]:
+            continue
+        rounded = int(value.quantize(decimal.Decimal('1'), rounding=rounding_mode))
+        if rounded == 0 and magnitude > 0:
+            # Never render a non-zero interval as "0 <unit>".
+            rounded = 1
+        plural_form = locale.plural_form(rounded)
+        pattern = _get_relative_time_pattern(locale, unit, format, direction, plural_form)
+        return pattern.replace('{0}', format_decimal(rounded, locale=locale))
+
+    raise AssertionError('unreachable')  # pragma: no cover
 
 
 def _format_fallback_interval(

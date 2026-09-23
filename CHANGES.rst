@@ -1,6 +1,17 @@
 Babel Changelog
 ===============
 
+Unreleased
+----------
+
+Features
+~~~~~~~~
+
+* Dates: Add `babel.dates.format_relative_time()` for locale-aware relative
+  time formatting (e.g. "in 2 hours" / "2 hours ago") with configurable
+  per-unit thresholds, rounding mode and granularity, exact ``Decimal``
+  arithmetic, and long/short/narrow pattern variants
+
 Version 2.18.0
 --------------
 

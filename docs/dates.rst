@@ -264,6 +264,47 @@ can limit the smallest unit to display:
     >>> format_timedelta(delta, granularity='month', locale='en_US')
     '1 month'
 
+Relative Time Formatting
+========================
+
+When you want to tell the user how far in the past or future an event is
+(for example in a notification center), use ``format_relative_time``.  It
+accepts a ``timedelta`` or a number of seconds as a ``Decimal`` (``int``
+and ``float`` also work) and renders a localized past or future phrase
+using the locale's own syntax:
+
+.. code-block:: pycon
+
+    >>> from babel.dates import format_relative_time
+    >>> format_relative_time(timedelta(hours=2), locale='en')
+    'in 2 hours'
+    >>> format_relative_time(timedelta(hours=-2), locale='en')
+    '2 hours ago'
+    >>> format_relative_time(timedelta(hours=2), locale='fr')
+    'dans 2 heures'
+
+The unit and the displayed value are chosen by comparing the interval
+against per-unit thresholds and rounding the result; the caller can tune
+the thresholds, the rounding mode, and the smallest and largest unit
+that may be displayed:
+
+.. code-block:: pycon
+
+    >>> thresholds = {'day': 1.1}
+    >>> format_relative_time(timedelta(hours=23), thresholds=thresholds, locale='en')
+    'in 23 hours'
+    >>> format_relative_time(timedelta(minutes=90), rounding_mode='ROUND_DOWN', locale='en')
+    'in 1 hour'
+    >>> format_relative_time(timedelta(days=3), max_granularity='hour', locale='en')
+    'in 72 hours'
+
+Unlike ``format_timedelta``, the value is never converted through a
+binary float, so negative zero, exact threshold crossings and very large
+intervals behave deterministically.  The plural category is always
+derived from the final displayed value, and if a locale lacks data for
+the requested unit or style, the function falls back to the default
+"long" variant and finally to the CLDR root patterns.
+
 .. _timezone-support:
 
 Time-zone Support

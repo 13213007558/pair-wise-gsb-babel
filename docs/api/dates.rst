@@ -17,6 +17,8 @@ Date and Time Formatting
 
 .. autofunction:: format_timedelta(delta, granularity='second', threshold=.85, add_direction=False, format='long', locale=default_locale('LC_TIME'))
 
+.. autofunction:: format_relative_time(delta, format='long', thresholds=None, rounding_mode='ROUND_HALF_EVEN', min_granularity='second', max_granularity='year', locale=default_locale('LC_TIME'))
+
 .. autofunction:: format_skeleton(skeleton, datetime=None, tzinfo=None, fuzzy=True, locale=default_locale('LC_TIME'))
 
 .. autofunction:: format_interval(start, end, skeleton=None, tzinfo=None, fuzzy=True, locale=default_locale('LC_TIME'))
