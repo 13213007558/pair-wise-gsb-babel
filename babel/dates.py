@@ -1257,6 +1257,8 @@ def parse_date(
     string: str,
     locale: Locale | str | None = None,
     format: _PredefinedTimeFormat | str = 'medium',
+    *,
+    strict: bool = False,
 ) -> datetime.date:
     """Parse a date from a string.
 
@@ -1282,13 +1284,43 @@ def parse_date(
     >>> parse_date('01.04.04', locale='de_DE', format='short')
     datetime.date(2004, 4, 1)
 
+    If ``strict`` is true, the string is instead parsed strictly against the
+    given LDML date pattern (or the locale's date pattern, if ``format`` is
+    one of "full", "long", "medium", or "short"), using the same pattern
+    syntax as ``format_date``:
+
+    >>> parse_date('4 mars 2026', locale='fr_FR', format='d MMMM y', strict=True)
+    datetime.date(2026, 3, 4)
+    >>> parse_date('4 марта 2026 г.', locale='ru_RU', format="d MMMM y 'г.'", strict=True)
+    datetime.date(2026, 3, 4)
+
+    In strict mode:
+
+    * The supported pattern fields are ``y`` (year), ``M``/``L`` (month),
+      ``d`` (day of month) and ``E``/``e``/``c`` (day of week), plus quoted
+      literal text. Any other pattern field is rejected with a `ValueError`.
+    * Month and day-of-week names are matched against the names of the given
+      locale only; ``M`` uses the "format" month names and ``L`` the
+      "stand-alone" ones. A name that matches several months or days (as
+      narrow names may) raises a `ParseError`.
+    * A day-of-week field that contradicts the parsed date raises a
+      `ParseError`.
+    * The whole string must be consumed by the pattern; errors are reported
+      with the position at which parsing failed.
+    * Two-digit years (``yy``) are mapped to the 21st century.
+
     :param string: the string containing the date
     :param locale: a `Locale` object or a locale identifier
     :param locale: a `Locale` object or a locale identifier. Defaults to the system time locale.
     :param format: the format to use, either an explicit date format,
                    or one of "full", "long", "medium", or "short"
                    (see ``get_time_format``)
+    :param strict: if true, parse the string strictly against the date
+                   pattern instead of using the lenient heuristic parser
     """
+    if strict:
+        return _parse_date_strict(string, locale=locale, format=format)
+
     numbers = re.findall(r'(\d+)', string)
     if not numbers:
         raise ParseError("No numbers were found in input")
@@ -1331,6 +1363,190 @@ def parse_date(
     if month > 12:
         month, day = day, month
     return datetime.date(year, month, day)
+
+
+#: Pattern fields supported by the strict date parser.
+_STRICT_DATE_FIELD_CHARS = frozenset('yMLdEec')
+
+
+def _parse_date_strict(
+    string: str,
+    locale: Locale | str | None = None,
+    format: _PredefinedTimeFormat | str | DateTimePattern = 'medium',
+) -> datetime.date:
+    """Parse a date string strictly against an LDML date pattern.
+
+    See `parse_date` for the user-facing documentation.
+    """
+    locale = Locale.parse(locale or LC_TIME)
+    if isinstance(format, DateTimePattern):
+        pattern = format.pattern
+    elif format in ('full', 'long', 'medium', 'short'):
+        pattern = get_date_format(format=format, locale=locale).pattern
+    else:
+        pattern = format
+
+    matchers = []
+    seen_kinds = set()
+    for tok_type, tok_value in tokenize_pattern(pattern):
+        if tok_type == 'chars':
+            matchers.append(('chars', _compile_strict_literal(tok_value), tok_value))
+        elif tok_type == 'field':
+            fieldchar, fieldnum = tok_value
+            if fieldchar not in _STRICT_DATE_FIELD_CHARS:
+                raise ValueError(
+                    f"Unsupported field {fieldchar * fieldnum!r} in strict date parsing "
+                    f"pattern {pattern!r}; only year (y), month (M/L), day (d) and "
+                    f"day of week (E/e/c) fields are supported",
+                )
+            kind, field_matcher = _compile_strict_field(fieldchar, fieldnum, locale)
+            seen_kinds.add(kind)
+            matchers.append(('field', kind, field_matcher))
+        else:
+            raise NotImplementedError(f"Unknown token type: {tok_type}")
+
+    missing = {'year', 'month', 'day'} - seen_kinds
+    if missing:
+        raise ValueError(
+            f"Strict date parsing pattern {pattern!r} must contain year (y), "
+            f"month (M/L) and day (d) fields; missing: {', '.join(sorted(missing))}",
+        )
+
+    pos = 0
+    year = month = day = weekday = None
+    weekday_text = None
+    for matcher in matchers:
+        if matcher[0] == 'chars':
+            _, regex, literal = matcher
+            match = regex.match(string, pos)
+            if match is None:
+                raise ParseError(
+                    f"Failed to parse literal {literal!r} at position {pos} in {string!r}",
+                )
+            pos = match.end()
+            continue
+
+        _, kind, (regex, lookup, fieldnum) = matcher
+        field_pos = pos
+        match = regex.match(string, pos)
+        if match is None:
+            raise ParseError(
+                f"Failed to parse {kind} at position {pos} in {string!r}",
+            )
+        text = match.group(0)
+        pos = match.end()
+
+        if lookup is not None:  # a named month or day of week
+            keys = lookup[text.casefold()]
+            if len(keys) > 1:
+                raise ParseError(
+                    f"Ambiguous {kind} name {text!r} at position {field_pos} in {string!r}",
+                )
+            value = next(iter(keys))
+        else:
+            value = int(text)
+
+        if kind == 'year':
+            year = 2000 + value if fieldnum == 2 else value
+        elif kind == 'month':
+            if not 1 <= value <= 12:
+                raise ParseError(
+                    f"Invalid month {value} at position {field_pos} in {string!r}",
+                )
+            month = value
+        elif kind == 'day':
+            if not 1 <= value <= 31:
+                raise ParseError(
+                    f"Invalid day {value} at position {field_pos} in {string!r}",
+                )
+            day = value
+        elif kind == 'weekday':
+            if lookup is None:  # numeric local day of week
+                if not 1 <= value <= 7:
+                    raise ParseError(
+                        f"Invalid day of week {value} at position {field_pos} in {string!r}",
+                    )
+                value = (value - 1 + locale.first_week_day) % 7
+            weekday = value
+            weekday_text = text
+
+    if pos != len(string):
+        raise ParseError(
+            f"Unexpected trailing characters at position {pos} in {string!r}",
+        )
+
+    try:
+        result = datetime.date(year, month, day)
+    except ValueError as exc:
+        raise ParseError(f"Invalid date in {string!r}: {exc}") from exc
+
+    if weekday is not None and result.weekday() != weekday:
+        raise ParseError(
+            f"Day of week {weekday_text!r} does not match date {result.isoformat()}",
+        )
+    return result
+
+
+def _compile_strict_literal(literal: str) -> re.Pattern:
+    """Compile a pattern literal into a regular expression.
+
+    Any run of whitespace in the literal matches any run of Unicode
+    whitespace in the input, so that e.g. no-break spaces in formatted
+    output need not match the pattern byte-for-byte.
+    """
+    parts = [
+        r'\s+' if chunk.isspace() else re.escape(chunk)
+        for chunk in re.split(r'(\s+)', literal)
+        if chunk
+    ]
+    return re.compile(''.join(parts))
+
+
+def _compile_strict_names(names: LocaleDataDict) -> tuple[re.Pattern, dict[str, set[int]]]:
+    """Compile a number-to-name mapping into a matcher.
+
+    Returns a regex matching any of the names (longest first,
+    case-insensitively) and a lookup mapping casefolded names to the
+    set of numbers they may stand for; a set with more than one entry
+    means the name is ambiguous.
+    """
+    lookup: dict[str, set[int]] = {}
+    for key, name in names.items():
+        lookup.setdefault(name.casefold(), set()).add(key)
+    alternation = sorted(set(names.values()), key=len, reverse=True)
+    regex = re.compile('|'.join(re.escape(name) for name in alternation), re.IGNORECASE)
+    return regex, lookup
+
+
+def _compile_strict_field(
+    char: str,
+    num: int,
+    locale: Locale,
+) -> tuple[str, tuple[re.Pattern, dict[str, set[int]] | None, int]]:
+    """Compile a single pattern field into a matcher.
+
+    Returns the field kind ("year", "month", "day" or "weekday") and a
+    tuple of (regex, name lookup, field width). The name lookup is None
+    for numeric fields.
+    """
+    if char == 'y':
+        return 'year', (re.compile(r'\d{2}' if num == 2 else r'\d+'), None, num)
+    if char in 'ML':
+        if num <= 2:
+            return 'month', (re.compile(r'\d{1,2}'), None, num)
+        width = {3: 'abbreviated', 4: 'wide', 5: 'narrow'}[num]
+        context = 'format' if char == 'M' else 'stand-alone'
+        regex, lookup = _compile_strict_names(get_month_names(width, context, locale))
+        return 'month', (regex, lookup, num)
+    if char == 'd':
+        return 'day', (re.compile(r'\d{1,2}'), None, num)
+    # char in 'Eec': day of week
+    if num < 3 and char != 'E':
+        return 'weekday', (re.compile(r'\d{1,2}'), None, num)
+    width = {3: 'abbreviated', 4: 'wide', 5: 'narrow', 6: 'short'}[max(num, 3)]
+    context = 'stand-alone' if char == 'c' else 'format'
+    regex, lookup = _compile_strict_names(get_day_names(width, context, locale))
+    return 'weekday', (regex, lookup, num)
 
 
 def parse_time(

@@ -712,6 +712,120 @@ def test_parse_date_alternate_characters(monkeypatch):
     assert dates.parse_date('2024-10-20') == date(2024, 10, 20)
 
 
+class TestStrictParseDate:
+
+    def test_basic(self):
+        assert dates.parse_date(
+            '4 mars 2026', locale='fr_FR', format='d MMMM y', strict=True,
+        ) == date(2026, 3, 4)
+        assert dates.parse_date(
+            '03/04/2026', locale='en_US', format='MM/dd/yyyy', strict=True,
+        ) == date(2026, 3, 4)
+
+    @pytest.mark.parametrize('locale', [
+        'de_DE', 'en_US', 'es_ES', 'fi_FI', 'fr_FR', 'ja_JP',
+        'ko_KR', 'pl_PL', 'ru_RU', 'sv_SE', 'uk_UA', 'zh_CN',
+    ])
+    @pytest.mark.parametrize('format', ['full', 'long', 'medium', 'short'])
+    def test_format_parse_roundtrip(self, locale, format):
+        dt = date(2026, 3, 4)
+        string = dates.format_date(dt, format=format, locale=locale)
+        assert dates.parse_date(string, locale=locale, format=format, strict=True) == dt
+
+    def test_leap_day(self):
+        assert dates.parse_date('29.02.2024', format='dd.MM.y', strict=True) == date(2024, 2, 29)
+        with pytest.raises(dates.ParseError):
+            dates.parse_date('29.02.2023', format='dd.MM.y', strict=True)
+
+    def test_month_context_format_vs_standalone(self):
+        # Russian months have distinct format (genitive) and stand-alone
+        # (nominative) forms; M and L must use the respective data.
+        assert dates.parse_date(
+            '4 марта 2026', locale='ru_RU', format='d MMMM y', strict=True,
+        ) == date(2026, 3, 4)
+        assert dates.parse_date(
+            '4 март 2026', locale='ru_RU', format='d LLLL y', strict=True,
+        ) == date(2026, 3, 4)
+        # The format-context name is not accepted for L and vice versa.
+        with pytest.raises(dates.ParseError):
+            dates.parse_date('4 марта 2026', locale='ru_RU', format='d LLLL y', strict=True)
+        with pytest.raises(dates.ParseError):
+            dates.parse_date('4 март 2026', locale='ru_RU', format='d MMMM y', strict=True)
+
+    def test_no_english_fallback(self):
+        with pytest.raises(dates.ParseError):
+            dates.parse_date('4 March 2026', locale='fr_FR', format='d MMMM y', strict=True)
+
+    def test_quoted_literals(self):
+        # Quoted pattern letters (y/M/d) are literal text, not fields.
+        fmt = "'y'y 'M'M 'd'd"
+        dt = date(2026, 3, 4)
+        string = dates.format_date(dt, fmt, locale='en_US')
+        assert string == 'y2026 M3 d4'
+        assert dates.parse_date(string, format=fmt, strict=True) == dt
+        with pytest.raises(dates.ParseError):
+            dates.parse_date('2026 3 4', format=fmt, strict=True)
+
+    def test_unicode_whitespace(self):
+        # Any Unicode whitespace matches pattern whitespace.
+        assert dates.parse_date(
+            '4\u00a0mars\u202f2026', locale='fr_FR', format='d MMMM y', strict=True,
+        ) == date(2026, 3, 4)
+
+    def test_ambiguous_narrow_month_name(self):
+        # In English, the narrow name 'J' may mean January, June or July.
+        with pytest.raises(dates.ParseError, match='Ambiguous month'):
+            dates.parse_date('J 4, 2026', locale='en_US', format='MMMMM d, y', strict=True)
+        # 'F' unambiguously means February.
+        assert dates.parse_date(
+            'F 4, 2026', locale='en_US', format='MMMMM d, y', strict=True,
+        ) == date(2026, 2, 4)
+
+    def test_weekday_mismatch(self):
+        # 2026-03-04 was a Wednesday.
+        fmt = 'EEEE, MMMM d, y'
+        assert dates.parse_date(
+            'Wednesday, March 4, 2026', locale='en_US', format=fmt, strict=True,
+        ) == date(2026, 3, 4)
+        with pytest.raises(dates.ParseError, match='Day of week'):
+            dates.parse_date('Thursday, March 4, 2026', locale='en_US', format=fmt, strict=True)
+
+    def test_no_month_day_swap(self):
+        # The lenient parser swaps a month > 12 with the day; the strict
+        # parser must instead fail.
+        assert dates.parse_date('13/04/2026', locale='en_US') == date(2026, 4, 13)
+        with pytest.raises(dates.ParseError, match='Invalid month'):
+            dates.parse_date('13/04/2026', locale='en_US', format='MM/dd/yyyy', strict=True)
+
+    def test_trailing_characters(self):
+        with pytest.raises(dates.ParseError, match='position 10'):
+            dates.parse_date('2026-03-04 extra', format='y-MM-dd', strict=True)
+
+    def test_error_position(self):
+        with pytest.raises(dates.ParseError, match='position 4'):
+            dates.parse_date('2026/03/04', format='y-MM-dd', strict=True)
+
+    def test_unsupported_field(self):
+        with pytest.raises(ValueError, match='Unsupported field'):
+            dates.parse_date('2026-03-04 12:00', format='y-MM-dd HH:mm', strict=True)
+        with pytest.raises(ValueError, match='Unsupported field'):
+            dates.parse_date('2026 n. Chr. 03-04', format="y G MM-dd", strict=True)
+
+    def test_incomplete_pattern(self):
+        with pytest.raises(ValueError, match='must contain'):
+            dates.parse_date('March 2026', format='MMMM y', strict=True)
+
+    def test_two_digit_year(self):
+        assert dates.parse_date('04.03.26', format='dd.MM.yy', strict=True) == date(2026, 3, 4)
+
+    def test_predefined_format_and_pattern_object(self):
+        assert dates.parse_date(
+            'Mar 4, 2026', locale='en_US', format='medium', strict=True,
+        ) == date(2026, 3, 4)
+        pattern = dates.get_date_format('long', locale='fr_FR')
+        assert dates.parse_date('4 mars 2026', locale='fr_FR', format=pattern, strict=True) == date(2026, 3, 4)
+
+
 def test_parse_time_custom_format():
     assert dates.parse_time('15:30:00', format='HH:mm:ss') == time(15, 30)
     assert dates.parse_time('00:30:15', format='ss:mm:HH') == time(15, 30)
