@@ -1,6 +1,16 @@
 Babel Changelog
 ===============
 
+Unreleased
+----------
+
+Features
+~~~~~~~~
+
+* Dates: Add `babel.dates.format_interval_skeleton()` for formatting date/time
+  intervals with CLDR interval patterns, with a caller-selected fallback and an
+  always-explicit locale.
+
 Version 2.18.0
 --------------
 

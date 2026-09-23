@@ -1171,6 +1171,165 @@ def format_interval(
     return _format_fallback_interval(start, end, skeleton, tzinfo, locale)
 
 
+def _format_skeleton_single(
+    instant: _Instant,
+    skeleton: str,
+    tzinfo: datetime.tzinfo | None,
+    locale: Locale,
+) -> str:
+    """
+    Format a single instant with the given skeleton, falling back to the
+    locale's default date/time formats if the skeleton is not available.
+    """
+    if skeleton in locale.datetime_skeletons:
+        return format_skeleton(skeleton, instant, tzinfo, fuzzy=False, locale=locale)
+    return _format_fallback_interval(instant, instant, skeleton, tzinfo, locale)
+
+
+def format_interval_skeleton(
+    start: _Instant,
+    end: _Instant,
+    skeleton: str,
+    tzinfo: datetime.tzinfo | None = None,
+    fuzzy: bool = True,
+    fallback: Literal["full", "raise"] = "full",
+    *,
+    locale: Locale | str,
+) -> str:
+    """
+    Format an interval between two instants using the locale's CLDR interval
+    pattern for the given skeleton, collapsing fields the instants share.
+
+    The interval pattern is chosen by the calendar field with the greatest
+    difference between ``start`` and ``end``, so each end of the output keeps
+    exactly the fields needed to remain unambiguous:
+
+    >>> from datetime import date, datetime
+    >>> format_interval_skeleton(date(2026, 3, 4), date(2026, 3, 6), "yMMMd", locale="zh")
+    '2026年3月4日至6日'
+
+    >>> format_interval_skeleton(date(2026, 3, 30), date(2026, 4, 2), "yMMMd", locale="en")
+    'Mar 30\\u2009\u2013\\u2009Apr 2, 2026'
+
+    If the instants are equal (or only differ in fields the skeleton does not
+    express), the interval degrades to a single formatted value:
+
+    >>> format_interval_skeleton(date(2026, 3, 4), date(2026, 3, 4), "yMMMd", locale="zh")
+    '2026年3月4日'
+
+    Day periods and narrow month names are supported like any other field:
+
+    >>> format_interval_skeleton(datetime(2026, 3, 4, 9), datetime(2026, 3, 4, 15), "Bhm", locale="zh")
+    '上午9:00至下午3:00'
+
+    >>> format_interval_skeleton(date(2026, 3, 4), date(2026, 3, 6), "yMMMMMd", locale="en")
+    'Mar 4\\u2009\u2013\\u20096, 2026'
+
+    If no interval pattern matches the skeleton, the ``fallback`` argument
+    decides what happens: ``"full"`` (the default) formats both ends in full
+    and joins them with the locale's interval fallback pattern, while
+    ``"raise"`` raises a :py:exc:`ValueError`:
+
+    >>> format_interval_skeleton(date(2026, 3, 4), date(2026, 3, 6), "xyz", fuzzy=False, locale="en")
+    'Mar 4, 2026\\u2009\u2013\\u2009Mar 6, 2026'
+
+    >>> format_interval_skeleton(date(2026, 3, 4), date(2026, 3, 6), "xyz", fuzzy=False, fallback="raise", locale="en")
+    Traceback (most recent call last):
+    ...
+    ValueError: No interval format found for skeleton 'xyz' in locale Locale('en')
+
+    The locale must always be passed explicitly; the system locale is never
+    consulted, and patterns are looked up in the locale's CLDR data rather
+    than guessed from strings.
+
+    :param start: First instant (datetime/date/time)
+    :param end: Second instant (datetime/date/time)
+    :param skeleton: The "skeleton format" to use for formatting.
+    :param tzinfo: tzinfo to use (if none is already attached)
+    :param fuzzy: If the skeleton is not found, allow choosing a skeleton that's
+                  close enough to it.
+    :param fallback: What to do when no interval pattern applies: ``"full"``
+                     formats both ends in full, ``"raise"`` raises a ValueError.
+    :param locale: A locale object or identifier. Required; the system locale
+                   is never used implicitly.
+    :return: Formatted interval
+    """
+    if locale is None:
+        raise ValueError(
+            "format_interval_skeleton() requires an explicit locale; "
+            "the system locale is never used implicitly",
+        )
+    locale = Locale.parse(locale)
+
+    if fallback not in ("full", "raise"):
+        raise ValueError(f"Invalid fallback mode: {fallback!r}")
+
+    # The quotes below are from the algorithm description in
+    # https://www.unicode.org/reports/tr35/tr35-dates.html#intervalFormats
+
+    # > Look for the intervalFormatItem element that matches the "skeleton",
+    # > starting in the current locale and then following the locale fallback
+    # > chain up to, but not including root.
+
+    interval_formats = locale.interval_formats
+
+    matched_skeleton = skeleton if skeleton and skeleton in interval_formats else None
+    if matched_skeleton is None and skeleton and fuzzy:
+        # > If no match was found from the previous step, check what the closest
+        # > match is in the fallback locale chain, as in availableFormats.
+        matched_skeleton = match_skeleton(skeleton, interval_formats)
+
+    if matched_skeleton is None:
+        # > Otherwise, format the start and end datetime using the fallback pattern.
+        if fallback == "raise":
+            raise ValueError(
+                f"No interval format found for skeleton {skeleton!r} in locale {locale!r}",
+            )
+        return _format_fallback_interval(start, end, skeleton, tzinfo, locale)
+
+    if start == end:
+        return _format_skeleton_single(start, matched_skeleton, tzinfo, locale)
+
+    skel_formats = interval_formats[matched_skeleton]
+
+    start = _ensure_datetime_tzinfo(_get_datetime(start), tzinfo=tzinfo)
+    end = _ensure_datetime_tzinfo(_get_datetime(end), tzinfo=tzinfo)
+
+    start_fmt = DateTimeFormat(start, locale=locale)
+    end_fmt = DateTimeFormat(end, locale=locale)
+
+    # > If a match is found from previous steps, compute the calendar field
+    # > with the greatest difference between start and end datetime. If there
+    # > is no difference among any of the fields in the pattern, format as a
+    # > single date using availableFormats, and return.
+
+    for field in PATTERN_CHAR_ORDER:  # These are in largest-to-smallest order
+        if field not in skel_formats:
+            continue
+        try:
+            differs = start_fmt.extract(field) != end_fmt.extract(field)
+        except NotImplementedError:
+            continue  # The field cannot be compared; assume it does not differ.
+        if differs:
+            # > If there is a match, use the pieces of the corresponding pattern to
+            # > format the start and end datetime, as above.
+            return "".join(
+                parse_pattern(pattern).apply(instant, locale)
+                for pattern, instant in zip(skel_formats[field], (start, end))
+            )
+
+    # The instants do not differ in any field the interval pattern can express.
+    # If they render identically, a single value is the correct representation;
+    # otherwise the difference is in a field no interval pattern covers, and
+    # the caller-chosen fallback applies.
+    if fallback == "raise":
+        raise ValueError(
+            f"No interval pattern for skeleton {matched_skeleton!r} covers "
+            f"the difference between {start!r} and {end!r} in locale {locale!r}",
+        )
+    return _format_fallback_interval(start, end, matched_skeleton, tzinfo, locale)
+
+
 def get_period_id(
     time: _Instant,
     tzinfo: datetime.tzinfo | None = None,
@@ -1488,7 +1647,7 @@ class DateTimeFormat:
         else:
             raise KeyError(f"Unsupported date/time field {char!r}")
 
-    def extract(self, char: str) -> int:
+    def extract(self, char: str) -> int | str:
         char = str(char)[0]
         if char == 'y':
             return self.value.year
@@ -1502,8 +1661,12 @@ class DateTimeFormat:
             return self.value.hour % 12 or 12
         elif char == 'm':
             return self.value.minute
+        elif char == 's':
+            return self.value.second
         elif char == 'a':
             return int(self.value.hour >= 12)  # 0 for am, 1 for pm
+        elif char in ('b', 'B'):
+            return get_period_id(self.value, locale=self.locale)
         else:
             raise NotImplementedError(
                 f"Not implemented: extracting {char!r} from {self.value!r}",
