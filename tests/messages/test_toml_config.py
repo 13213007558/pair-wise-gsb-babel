@@ -41,6 +41,11 @@ pattern = ["xyz/**.py", "foo/**.py"]
         pytest.param('"foo:1,2 bar quz"', {'bar': None, 'foo': (1, 2), 'quz': None}, id='s-args'),
         pytest.param('["bar", "foo:1,2", "quz"]', {'bar': None, 'foo': (1, 2), 'quz': None}, id='l-args'),
         pytest.param('[]', None, id='empty'),
+        pytest.param(
+            '["ngettext:singular=msgid,plural=msgid_plural,n="]',
+            {'ngettext': {'singular': 'msgid', 'plural': 'msgid_plural', 'n': None}},
+            id='l-named-args',
+        ),
     ],
 )
 def test_toml_mapping_keywords_parsing(keywords_val, expected):

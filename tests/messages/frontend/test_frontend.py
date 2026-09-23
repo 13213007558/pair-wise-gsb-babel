@@ -143,6 +143,38 @@ def test_parse_keywords():
     }
 
 
+def test_parse_keywords_named_spec():
+    kw = frontend.parse_keywords([
+        'ngettext:singular=msgid,plural=msgid_plural,n=',
+        'pgettext:context=msgctxt,msgid=msgid',
+    ])
+    assert kw == {
+        'ngettext': {'singular': 'msgid', 'plural': 'msgid_plural', 'n': None},
+        'pgettext': {'context': 'msgctxt', 'msgid': 'msgid'},
+    }
+
+
+def test_parse_keywords_named_spec_with_arity():
+    kw = frontend.parse_keywords(['foo:1,1t', 'foo:context=msgctxt,msgid=msgid,2t'])
+    assert kw == {
+        'foo': {
+            1: (1,),
+            2: {'context': 'msgctxt', 'msgid': 'msgid'},
+        },
+    }
+
+
+def test_parse_keywords_named_spec_errors():
+    with pytest.raises(ValueError, match='cannot mix positional and named'):
+        frontend.parse_keywords(['ngettext:1,singular=msgid'])
+    with pytest.raises(ValueError, match='cannot mix positional and named'):
+        frontend.parse_keywords(['ngettext:singular=msgid,2'])
+    with pytest.raises(ValueError, match='invalid role'):
+        frontend.parse_keywords(['ngettext:singular=bogus'])
+    with pytest.raises(ValueError, match='invalid parameter name'):
+        frontend.parse_keywords(['ngettext:1st=msgid'])
+
+
 def test_parse_keywords_with_t():
     kw = frontend.parse_keywords(['_:1', '_:2,2t', '_:2c,3,3t'])
 

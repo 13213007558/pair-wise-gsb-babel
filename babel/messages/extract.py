@@ -36,7 +36,7 @@ from functools import lru_cache
 from os.path import relpath
 from textwrap import dedent
 from tokenize import COMMENT, NAME, NL, OP, STRING, generate_tokens
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict
 
 from babel.messages._compat import find_entrypoints
 from babel.util import parse_encoding, parse_future_flags, pathmatch
@@ -61,7 +61,14 @@ if TYPE_CHECKING:
         def tell(self) -> int: ...
 
     _SimpleKeyword: TypeAlias = tuple[int | tuple[int, int] | tuple[int, str], ...] | None
-    _Keyword: TypeAlias = dict[int | None, _SimpleKeyword] | _SimpleKeyword
+    # A "named" keyword specification maps a translation function's parameter
+    # names to their roles; the declaration order also defines the positional
+    # parameter order.  Recognized roles are "msgid", "msgid_plural" and
+    # "msgctxt"; a parameter mapped to None is not extracted.
+    _NamedKeyword: TypeAlias = dict[str, str | None]
+    _Keyword: TypeAlias = (
+        dict[int | None, _SimpleKeyword | _NamedKeyword] | _SimpleKeyword | _NamedKeyword
+    )
 
     # 5-tuple of (filename, lineno, messages, comments, context)
     _FileExtractionResult: TypeAlias = tuple[str, int, str | tuple[str, ...], list[str], str | None]  # fmt: skip
@@ -79,6 +86,35 @@ if TYPE_CHECKING:
     _ExtractionMethod: TypeAlias = _CallableExtractionMethod | str
 
 GROUP_NAME: Final[str] = 'babel.extractors'
+
+#: Roles that may be used in a named keyword specification.
+ROLE_MSGID: Final[str] = 'msgid'
+ROLE_MSGID_PLURAL: Final[str] = 'msgid_plural'
+ROLE_MSGCTXT: Final[str] = 'msgctxt'
+SPEC_ROLES: Final[frozenset[str]] = frozenset({ROLE_MSGID, ROLE_MSGID_PLURAL, ROLE_MSGCTXT})
+
+
+class _CallArgument(NamedTuple):
+    """A single argument of a translation function call.
+
+    The Python extractor emits these (instead of plain strings) for calls
+    that use keyword arguments or argument unpacking, so that the arguments
+    can be matched against named keyword specifications.
+    """
+
+    #: The keyword parameter name, or None for positional arguments.
+    name: str | None
+    #: The static string value of the argument, or None if it is not a
+    #: statically determinable string.
+    value: str | None
+    #: The line number where the argument starts.
+    lineno: int
+    #: '*', '**' or '' if the argument unpacks an iterable/mapping.
+    star: str = ''
+
+
+#: Sentinel for call arguments that cannot be statically determined.
+_UNKNOWN: Final = object()
 
 DEFAULT_KEYWORDS: dict[str, _Keyword] = {
     '_': None,
@@ -391,6 +427,14 @@ def _match_messages_against_spec(
     fileobj: _FileObj,
     spec: tuple[int | tuple[int, str], ...],
 ):
+    # Unwrap enriched arguments emitted by the Python extractor; for
+    # positional specifications only the argument values, in call order,
+    # are relevant.
+    messages = [
+        message.value if isinstance(message, _CallArgument) else message
+        for message in messages
+    ]
+
     translatable = []
     context = None
 
@@ -428,6 +472,124 @@ def _match_messages_against_spec(
         translatable = translatable[0]
 
     return lineno, translatable, comments, context
+
+
+def _is_empty_argument(arg: Any) -> bool:
+    """Return True if the given call argument carries no information,
+    i.e. it is a placeholder for a missing argument."""
+    if isinstance(arg, _CallArgument):
+        return arg.name is None and arg.value is None and not arg.star
+    return arg is None
+
+
+def _is_named_spec(spec: Any) -> bool:
+    """Return True if the given keyword specification is a named
+    specification (mapping parameter names to roles) rather than an
+    arity map or a positional specification."""
+    return (
+        isinstance(spec, dict)
+        and bool(spec)
+        and all(isinstance(key, str) for key in spec)
+    )
+
+
+def _match_named_spec_against_messages(
+    lineno: int,
+    messages: list[str | None | _CallArgument],
+    comments: list[str],
+    fileobj: _FileObj,
+    spec: dict[str, str | None],
+):
+    """Match a call's arguments against a named keyword specification.
+
+    The specification maps parameter names to roles ("msgid",
+    "msgid_plural", "msgctxt" or None); its declaration order also
+    defines the positional parameter order, so positional and keyword
+    calls resolve to the same message.
+
+    Only calls whose declared roles are all bound to statically
+    determinable strings produce a message; calls involving ``*args``,
+    ``**kwargs`` or duplicate bindings are only extracted as far as the
+    binding can be determined unambiguously.
+    """
+    param_names = list(spec)
+    # Ignore trailing empty arguments; they are an artifact of trailing
+    # commas in calls such as ``ngettext(singular='file', plural='files',)``
+    # and would otherwise be mistaken for positional arguments.
+    messages = list(messages)
+    while messages and _is_empty_argument(messages[-1]):
+        messages.pop()
+
+    bindings: dict[str, list[tuple[str | None, int]]] = {}
+    position = 0
+    positional_reliable = True
+    for arg in messages:
+        if isinstance(arg, _CallArgument):
+            if arg.star == '**':
+                # ``**kwargs`` cannot invalidate arguments that are
+                # bound explicitly.
+                continue
+            if arg.star == '*':
+                # ``*args`` makes the positions of all following
+                # positional arguments undeterminable.
+                positional_reliable = False
+                continue
+            value, arg_lineno, name = arg.value, arg.lineno, arg.name
+            if name is None:
+                if not positional_reliable:
+                    continue
+                name = param_names[position] if position < len(param_names) else None
+                position += 1
+                if name is None:
+                    continue
+        else:
+            # Plain positional argument, e.g. from another extractor.
+            if not positional_reliable:
+                continue
+            value, arg_lineno = arg, lineno
+            name = param_names[position] if position < len(param_names) else None
+            position += 1
+            if name is None:
+                continue
+        if name in spec:
+            bindings.setdefault(name, []).append((value, arg_lineno))
+
+    def resolve(role: str) -> tuple[str | None, int] | None:
+        for name, param_role in spec.items():
+            if param_role != role:
+                continue
+            bound = bindings.get(name)
+            if bound is None or len(bound) != 1:
+                # The parameter is not bound, or bound more than once,
+                # so its value cannot be determined.
+                return _UNKNOWN
+            return bound[0]
+        return None  # the role is not declared in the specification
+
+    msgid = resolve(ROLE_MSGID)
+    if msgid is None or msgid is _UNKNOWN or msgid[0] is None:
+        return
+    plural = resolve(ROLE_MSGID_PLURAL)
+    if plural is _UNKNOWN or (plural is not None and plural[0] is None):
+        return
+    context = resolve(ROLE_MSGCTXT)
+    if context is _UNKNOWN or (context is not None and context[0] is None):
+        return
+
+    # An empty string msgid isn't valid, emit a warning
+    if not msgid[0]:
+        filename = getattr(fileobj, "name", None) or "(unknown)"
+        sys.stderr.write(
+            f"{filename}:{msgid[1]}: warning: Empty msgid.  It is reserved by GNU gettext: gettext(\"\") "
+            f"returns the header entry with meta information, not the empty string.\n",
+        )
+        return
+
+    if plural is not None:
+        message = (msgid[0], plural[0])
+    else:
+        message = msgid[0]
+    return msgid[1], message, comments, context[0] if context is not None else None
 
 
 @lru_cache(maxsize=None)
@@ -476,6 +638,10 @@ def extract(
                      that should be recognized as translation functions) to
                      tuples that specify which of their arguments contain
                      localizable strings
+                     ; a specification may also be a dictionary mapping the
+                     function's parameter names to their roles ("msgid",
+                     "msgid_plural", "msgctxt" or None), in which case the
+                     declaration order defines the positional parameter order
     :param comment_tags: a list of translator tags to search for and include
                          in the results
     :param options: a dictionary of additional options (optional)
@@ -514,7 +680,11 @@ def extract(
 
         specs = keywords[funcname] or None if funcname else None
         # {None: x} may be collapsed into x for backwards compatibility.
-        if not isinstance(specs, dict):
+        if _is_named_spec(specs):
+            # A named specification maps parameter names to roles; it
+            # applies to calls of any arity.
+            specs = {None: specs}
+        elif not isinstance(specs, dict):
             specs = {None: specs}
 
         if strip_comment_tags:
@@ -528,7 +698,10 @@ def extract(
                 continue
             if spec is None:
                 spec = (1,)
-            result = _match_messages_against_spec(lineno, messages, comments, fileobj, spec)
+            if isinstance(spec, dict):
+                result = _match_named_spec_against_messages(lineno, messages, comments, fileobj, spec)
+            else:
+                result = _match_messages_against_spec(lineno, messages, comments, fileobj, spec)
             if result is not None:
                 yield result
 
@@ -556,6 +729,12 @@ def extract_python(
     It returns an iterator yielding tuples in the following form ``(lineno,
     funcname, message, comments)``.
 
+    For calls that use keyword arguments or argument unpacking, the message
+    items are emitted as `_CallArgument` tuples (carrying the parameter
+    name, the static value, the line number and any unpacking marker), so
+    that `extract` can match them against keyword specifications that
+    declare parameter names and roles.
+
     :param fileobj: the seekable, file-like object the messages should be
                     extracted from
     :param keywords: a list of keywords (i.e. function names) that should be
@@ -572,6 +751,32 @@ def extract_python(
     translator_comments = []
     in_def = in_translator_comments = False
     comment_tag = None
+
+    # State for the argument currently being parsed at call depth 1.
+    arg_name = None  # keyword parameter name of the current argument
+    arg_star = ''  # '*', '**' or '' for unpacking arguments
+    arg_lineno = None  # line number where the current argument starts
+    arg_started = False  # whether the current argument has any value tokens
+    pending_name = None  # a NAME token that may be a keyword parameter name
+    arg_static = True  # whether the current argument consists only of string tokens
+
+    def flush_argument():
+        nonlocal arg_name, arg_star, arg_lineno, arg_started, arg_static, pending_name
+        messages.append(
+            _CallArgument(
+                arg_name,
+                ''.join(buf) if buf and arg_static else None,
+                arg_lineno or lineno,
+                arg_star,
+            ),
+        )
+        del buf[:]
+        arg_name = None
+        arg_star = ''
+        arg_lineno = None
+        arg_started = False
+        arg_static = True
+        pending_name = None
 
     encoding = parse_encoding(fileobj) or options.get('encoding', 'UTF-8')
     future_flags = parse_future_flags(fileobj, encoding)
@@ -594,6 +799,11 @@ def extract_python(
                 continue
             if funcname:
                 call_stack.append(lineno)
+                if len(call_stack) > 1 and pending_name is not None:
+                    # A name followed by `(` is a call, not a keyword argument.
+                    pending_name = None
+                    arg_started = True
+                    arg_static = False
         elif in_def and tok == OP and value == ':':
             # End of a class definition without parens
             in_def = False
@@ -614,14 +824,24 @@ def extract_python(
                     break
         elif funcname and len(call_stack) == 1:
             nested = tok == NAME and value in keywords
+            if pending_name is not None and tok not in (NL, COMMENT) and not (tok == OP and value == '='):
+                # The previous NAME token was part of a runtime expression,
+                # not a keyword argument name.
+                pending_name = None
+                arg_started = True
+                arg_static = False
             if (tok == OP and value == ')') or nested:
-                if buf:
-                    messages.append(''.join(buf))
-                    del buf[:]
-                else:
-                    messages.append(None)
+                flush_argument()
 
-                messages = tuple(messages) if len(messages) > 1 else messages[0]
+                if any(arg.name is not None or arg.star for arg in messages):
+                    # The call used keyword arguments or argument unpacking;
+                    # emit the enriched argument representation so that the
+                    # arguments can be matched against named keyword
+                    # specifications.
+                    collected = tuple(messages)
+                else:
+                    values = [arg.value for arg in messages]
+                    collected = tuple(values) if len(values) > 1 else values[0]
 
                 if translator_comments:
                     last_comment_lineno = translator_comments[-1][0]
@@ -634,7 +854,7 @@ def extract_python(
                 yield (
                     message_lineno,
                     funcname,
-                    messages,
+                    collected,
                     [comment[1] for comment in translator_comments],
                 )
 
@@ -651,12 +871,18 @@ def extract_python(
                     if not message_lineno:
                         message_lineno = lineno
                     buf.append(val)
+                arg_started = True
+                if arg_lineno is None:
+                    arg_lineno = lineno
 
             # Python 3.12+, see https://peps.python.org/pep-0701/#new-tokens
             elif tok == FSTRING_START:
                 current_fstring_start = value
                 if not message_lineno:
                     message_lineno = lineno
+                arg_started = True
+                if arg_lineno is None:
+                    arg_lineno = lineno
             elif tok == FSTRING_MIDDLE:
                 if current_fstring_start is not None:
                     current_fstring_start += value
@@ -668,11 +894,7 @@ def extract_python(
                         buf.append(val)
 
             elif tok == OP and value == ',':
-                if buf:
-                    messages.append(''.join(buf))
-                    del buf[:]
-                else:
-                    messages.append(None)
+                flush_argument()
                 if translator_comments:
                     # We have translator comments, and since we're on a
                     # comma(,) user is allowed to break into a new line
@@ -681,8 +903,45 @@ def extract_python(
                     old_lineno, old_comment = translator_comments.pop()
                     translator_comments.append((old_lineno + 1, old_comment))
 
-            elif tok != NL and not message_lineno:
-                message_lineno = lineno
+            elif tok == OP and value == '=' and pending_name is not None and not buf:
+                # `name=` at call depth: a keyword argument.
+                arg_name, arg_lineno = pending_name
+                pending_name = None
+            elif (
+                tok == OP
+                and value in ('*', '**')
+                and pending_name is None
+                and arg_name is None
+                and not buf
+                and not arg_started
+                and not arg_star
+            ):
+                # `*args` or `**kwargs` unpacking.
+                arg_star = value
+                if arg_lineno is None:
+                    arg_lineno = lineno
+                if not message_lineno:
+                    message_lineno = lineno
+            elif tok == NAME and arg_name is None and not buf and not arg_started and not arg_star:
+                # A bare name may turn out to be a keyword argument name
+                # if an `=` token follows.
+                pending_name = (value, lineno)
+                if arg_lineno is None:
+                    arg_lineno = lineno
+                if not message_lineno:
+                    message_lineno = lineno
+            elif tok == COMMENT:
+                if not message_lineno:
+                    message_lineno = lineno
+            elif tok != NL:
+                # Any other token is part of a runtime expression.
+                pending_name = None
+                arg_started = True
+                arg_static = False
+                if arg_lineno is None:
+                    arg_lineno = lineno
+                if not message_lineno:
+                    message_lineno = lineno
         elif len(call_stack) > 1 and tok == OP and value == ')':
             call_stack.pop()
         elif funcname and not call_stack:

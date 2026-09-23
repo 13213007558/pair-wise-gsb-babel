@@ -17,6 +17,9 @@ Features
 * Core: Use canonical IANA zone names in zone_territories by @akx in :gh:`1220`
 * Messages: Improve extract performance via ignoring directories early during os.walk by @akx in :gh:`968`
 * Messages: Merge in per-format keywords and auto_comments by @akx in :gh:`1243`
+* Messages: Support keyword specifications that declare a translation function's
+  parameter names and roles (e.g. ``ngettext:singular=msgid,plural=msgid_plural``),
+  so Python keyword and positional calls extract to the same message
 * Messages: Update keywords for extraction of dpgettext and dnpgettext by @mardiros in :gh:`1235`
 * Messages: Validate all plurals in Python format checker by @tomasr8 in :gh:`1188`
 * Time: Use standard library `timezone` instead of `FixedOffsetTimezone` by @akx in :gh:`1203`

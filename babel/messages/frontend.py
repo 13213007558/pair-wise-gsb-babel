@@ -32,6 +32,7 @@ from babel.messages.catalog import DEFAULT_HEADER, Catalog
 from babel.messages.extract import (
     DEFAULT_KEYWORDS,
     DEFAULT_MAPPING,
+    SPEC_ROLES,
     check_and_call_extract_file,
     extract_from_dir,
 )
@@ -1239,16 +1240,41 @@ def _parse_mapping_toml(
     return _parse_config_object(babel_data, filename=filename)
 
 
-def _parse_spec(s: str) -> tuple[int | None, tuple[int | tuple[int, str], ...]]:
+def _parse_spec(s: str) -> tuple[int | None, tuple[int | tuple[int, str], ...] | dict[str, str | None]]:
     inds = []
+    named = None
     number = None
     for x in s.split(','):
-        if x[-1] == 't':
+        if '=' in x:
+            name, _, role = (part.strip() for part in x.partition('='))
+            if inds:
+                raise ValueError(
+                    f"cannot mix positional and named arguments in keyword specification {s!r}",
+                )
+            if not name.isidentifier():
+                raise ValueError(
+                    f"invalid parameter name {name!r} in keyword specification {s!r}",
+                )
+            if role and role not in SPEC_ROLES:
+                raise ValueError(
+                    f"invalid role {role!r} in keyword specification {s!r}; "
+                    f"expected one of: {', '.join(sorted(SPEC_ROLES))}",
+                )
+            if named is None:
+                named = {}
+            named[name] = role or None
+        elif x[-1] == 't':
             number = int(x[:-1])
+        elif named is not None:
+            raise ValueError(
+                f"cannot mix positional and named arguments in keyword specification {s!r}",
+            )
         elif x[-1] == 'c':
             inds.append((int(x[:-1]), 'c'))
         else:
             inds.append(int(x))
+    if named is not None:
+        return number, named
     return number, tuple(inds)
 
 
@@ -1267,6 +1293,16 @@ def parse_keywords(strings: Iterable[str] = ()):
 
     The input keywords are in GNU Gettext style; see :doc:`cmdline` for details.
 
+    Instead of argument positions, a specification may also declare the
+    translation function's parameter names and their roles, using
+    ``name=role`` items where the role is one of ``msgid``, ``msgid_plural``
+    or ``msgctxt`` (an empty role means the parameter is not extracted).
+    The declaration order also defines the positional parameter order, so
+    positional and keyword calls resolve to the same message:
+
+    >>> pprint.pprint(parse_keywords(['ngettext:singular=msgid,plural=msgid_plural,n=']))
+    {'ngettext': {'n': None, 'plural': 'msgid_plural', 'singular': 'msgid'}}
+
     The output is a dictionary mapping keyword names to a dictionary of specifications.
     Keys in this dictionary are numbers of arguments, where ``None`` means that all numbers
     of arguments are matched, and a number means only calls with that number of arguments
@@ -1280,6 +1316,9 @@ def parse_keywords(strings: Iterable[str] = ()):
     ``(n, 'c')``, meaning that the nth argument should be extracted as context for the
     messages. A ``None`` specification is equivalent to ``(1,)``, extracting the first
     argument.
+
+    A specification may also be a dictionary mapping parameter names to roles
+    (``msgid``, ``msgid_plural``, ``msgctxt`` or ``None``), as described above.
     """
     keywords = {}
     for string in strings:

@@ -157,6 +157,17 @@ The meaning of ``--keyword`` values is as follows:
   whether it takes one or two arguments, you can pass
   ``--keyword=foo:1,1t --keyword=foo:1c,2,2t``.
 
+- For Python code, you may also declare the translation function's
+  parameter names and their roles instead of argument positions, using
+  ``name=role`` items where the role is one of ``msgid``, ``msgid_plural``
+  or ``msgctxt`` (an empty role means the parameter is not extracted).
+  The declaration order also defines the positional parameter order, so
+  positional and keyword calls resolve to the same message.  For example,
+  with ``--keyword=ngettext:singular=msgid,plural=msgid_plural,n=``, both
+  ``ngettext('file', 'files', count)`` and
+  ``ngettext(n=count, plural='files', singular='file')`` produce the same
+  message.
+
 The default keywords are equivalent to passing ::
 
   --keyword=_

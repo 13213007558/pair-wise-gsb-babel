@@ -403,9 +403,22 @@ n = ngettext('foo')
 """)
     messages = list(extract.extract_python(buf, ('_', 'ngettext'), [], {}))
     assert messages[0][2] == ('foo', 'bar')
-    assert messages[1][2] == ('hello', 'there', None)
-    assert messages[2][2] == (None, 'hello', 'there')
-    assert messages[3][2] == (None, None)
+    # Calls using keyword arguments or argument unpacking emit enriched
+    # _CallArgument items (name, value, lineno, star).
+    assert messages[1][2] == (
+        extract._CallArgument(None, 'hello', 3),
+        extract._CallArgument(None, 'there', 3),
+        extract._CallArgument('n', None, 3),
+    )
+    assert messages[2][2] == (
+        extract._CallArgument('n', None, 4),
+        extract._CallArgument(None, 'hello', 4),
+        extract._CallArgument(None, 'there', 4),
+    )
+    assert messages[3][2] == (
+        extract._CallArgument('n', None, 5),
+        extract._CallArgument(None, None, 5, '*'),
+    )
     assert messages[4][2] is None
     assert messages[5][2] == 'foo'
 
@@ -501,11 +514,17 @@ _('Hello, {0} and {1}!', _('Heungsub'),
 _('Armin'))
 """)
     messages = list(extract.extract_python(buf, ('_',), ['NOTE:'], {}))
-    assert messages[0][2] == ('Hello, {name}!', None)
+    assert messages[0][2] == (
+        extract._CallArgument(None, 'Hello, {name}!', 3),
+        extract._CallArgument('name', None, 3),
+    )
     assert messages[0][3] == ['NOTE: First']
     assert messages[1][2] == 'Foo Bar'
     assert messages[1][3] == []
-    assert messages[2][2] == ('Hello, {name1} and {name2}!', None)
+    assert messages[2][2] == (
+        extract._CallArgument(None, 'Hello, {name1} and {name2}!', 6),
+        extract._CallArgument('name1', None, 6),
+    )
     assert messages[2][3] == ['NOTE: Second']
     assert messages[3][2] == 'Heungsub'
     assert messages[3][3] == []
