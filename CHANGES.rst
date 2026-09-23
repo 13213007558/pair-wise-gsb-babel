@@ -1,6 +1,19 @@
 Babel Changelog
 ===============
 
+Version 2.19.0
+--------------
+
+(Unreleased)
+
+Features
+~~~~~~~~
+
+* Numbers: Add a ``cash`` parameter to ``format_currency`` to round amounts to the
+  currency's legal cash step (CLDR ``cashDigits``/``cashRounding``, e.g. 0.05 for CHF),
+  along with the ``get_currency_cash_precision()`` and ``get_currency_cash_rounding()``
+  helpers
+
 Version 2.18.0
 --------------
 

@@ -306,6 +306,124 @@ def test_format_currency_format_type():
             == '1.099,98')
 
 
+def test_get_currency_cash_precision_and_rounding():
+    assert numbers.get_currency_cash_precision('CHF') == 2
+    assert numbers.get_currency_cash_rounding('CHF') == 5
+    # USD has no cash-specific data; the CLDR fallback is the regular
+    # digits/rounding of the currency (here: the default of 2 digits).
+    assert numbers.get_currency_cash_precision('USD') == 2
+    assert numbers.get_currency_cash_rounding('USD') == 0
+    # TWD cash amounts are rounded to whole dollars.
+    assert numbers.get_currency_cash_precision('TWD') == 0
+
+
+@pytest.mark.parametrize(('input_value', 'expected_standard', 'expected_cash'), [
+    # CHF cash amounts are rounded to the nearest 0.05 (ROUND_HALF_EVEN).
+    ('1.03', 'CHF1.03', 'CHF1.05'),
+    ('1.02', 'CHF1.02', 'CHF1.00'),
+    ('1.025', 'CHF1.02', 'CHF1.00'),   # cash midpoint 20.5 -> 20 (even)
+    ('1.075', 'CHF1.08', 'CHF1.10'),   # cash midpoint 21.5 -> 22 (even)
+    ('2.975', 'CHF2.98', 'CHF3.00'),   # rounding carries into the integer part
+    ('0.98', 'CHF0.98', 'CHF1.00'),
+    ('-1.03', '-CHF1.03', '-CHF1.05'),
+    ('-1.025', '-CHF1.02', '-CHF1.00'),
+])
+def test_format_currency_cash_vs_standard_chf(input_value, expected_standard, expected_cash):
+    value = decimal.Decimal(input_value)
+    assert numbers.format_currency(value, 'CHF', locale='en_US') == expected_standard
+    assert numbers.format_currency(value, 'CHF', locale='en_US', cash=True) == expected_cash
+
+
+@pytest.mark.parametrize('input_value', ['1.03', '1.025', '2.975', '-1.03'])
+def test_format_currency_cash_currency_without_cash_step(input_value):
+    # USD has no special cash step: cash and standard output are identical.
+    value = decimal.Decimal(input_value)
+    assert (numbers.format_currency(value, 'USD', locale='en_US', cash=True)
+            == numbers.format_currency(value, 'USD', locale='en_US'))
+
+
+def test_format_currency_cash_input_types():
+    # String and float inputs are converted through their string form, never
+    # through float arithmetic.
+    assert numbers.format_currency('1.03', 'CHF', locale='en_US', cash=True) == 'CHF1.05'
+    assert numbers.format_currency(1.03, 'CHF', locale='en_US', cash=True) == 'CHF1.05'
+
+
+def test_format_currency_cash_respects_decimal_context_switching():
+    value = decimal.Decimal('1.025')  # exact midpoint of the 0.05 cash step
+    results = []
+    for rounding in (
+        decimal.ROUND_HALF_EVEN,
+        decimal.ROUND_HALF_UP,
+        decimal.ROUND_HALF_EVEN,
+        decimal.ROUND_HALF_DOWN,
+    ):
+        with decimal.localcontext() as ctx:
+            ctx.rounding = rounding
+            results.append(numbers.format_currency(value, 'CHF', locale='en_US', cash=True))
+    assert results == ['CHF1.00', 'CHF1.05', 'CHF1.00', 'CHF1.00']
+    # The default context is left untouched by the switches above.
+    assert decimal.getcontext().rounding == decimal.ROUND_HALF_EVEN
+    assert numbers.format_currency(value, 'CHF', locale='en_US', cash=True) == 'CHF1.00'
+
+
+def test_format_currency_cash_with_currency_digits_false():
+    # The pattern alone would display only integers, but a cash amount must
+    # stay on its legal step; the display precision is raised accordingly.
+    assert (numbers.format_currency(decimal.Decimal('1.03'), 'CHF', '#,##0',
+                                    locale='en_US', currency_digits=False, cash=True)
+            == '1.05')
+    # Without cash, the same options honor the pattern as-is.
+    assert (numbers.format_currency(decimal.Decimal('1.03'), 'CHF', '#,##0',
+                                    locale='en_US', currency_digits=False)
+            == '1')
+
+
+def test_format_currency_cash_with_custom_pattern():
+    # Symbol placement and grouping still come from the pattern.
+    assert (numbers.format_currency(decimal.Decimal('1.03'), 'CHF', '#,##0.00 ¤¤',
+                                    locale='en_US', cash=True)
+            == '1.05 CHF')
+    assert (numbers.format_currency(decimal.Decimal('1099.987'), 'CHF', '¤¤ #,##0.00',
+                                    locale='en_US', cash=True)
+            == 'CHF 1,100.00')
+
+
+def test_format_currency_cash_with_decimal_quantization_false():
+    # The amount is still rounded to the cash step (that is what makes it a
+    # cash amount), but no further quantization is applied.
+    assert (numbers.format_currency(decimal.Decimal('1.037'), 'CHF', locale='en_US',
+                                    cash=True, decimal_quantization=False)
+            == 'CHF1.05')
+    assert (numbers.format_currency(decimal.Decimal('1.037'), 'CHF', locale='en_US',
+                                    decimal_quantization=False)
+            == 'CHF1.037')
+
+
+def test_format_currency_cash_accounting_and_grouping():
+    assert (numbers.format_currency(decimal.Decimal('-1.03'), 'CHF', locale='en_US',
+                                    format_type='accounting', cash=True)
+            == '(CHF1.05)')
+    assert (numbers.format_currency(decimal.Decimal('1099.987'), 'CHF', locale='en_US', cash=True)
+            == 'CHF1,100.00')
+    assert (numbers.format_currency(decimal.Decimal('1.03'), 'CHF', locale='de_CH', cash=True)
+            == 'CHF\xa01.05')
+
+
+def test_format_currency_cash_long_display_name():
+    assert (numbers.format_currency(decimal.Decimal('1.03'), 'CHF', locale='en_US',
+                                    format_type='name', cash=True)
+            == '1.05 Swiss francs')
+    # The plural form is chosen from the actually displayed (cash-rounded)
+    # value: TWD cash amounts are rounded to whole dollars.
+    assert (numbers.format_currency(decimal.Decimal('1.4'), 'TWD', locale='en_US',
+                                    format_type='name')
+            == '1.40 New Taiwan dollars')
+    assert (numbers.format_currency(decimal.Decimal('1.4'), 'TWD', locale='en_US',
+                                    format_type='name', cash=True)
+            == '1 New Taiwan dollar')
+
+
 def test_format_compact_currency():
     assert numbers.format_compact_currency(1, 'USD', locale='en_US', format_type="short") == '$1'
     assert numbers.format_compact_currency(999, 'USD', locale='en_US', format_type="short") == '$999'
