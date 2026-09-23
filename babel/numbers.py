@@ -24,6 +24,7 @@ from __future__ import annotations
 import datetime
 import decimal
 import re
+import unicodedata
 import warnings
 from typing import Any, Literal, cast, overload
 
@@ -1066,10 +1067,21 @@ def format_scientific(
 class NumberFormatError(ValueError):
     """Exception raised when a string cannot be parsed into a number."""
 
-    def __init__(self, message: str, suggestions: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        suggestions: list[str] | None = None,
+        *,
+        position: int | None = None,
+        expected_grouping: str | None = None,
+    ) -> None:
         super().__init__(message)
         #: a list of properly formatted numbers derived from the invalid input
         self.suggestions = suggestions
+        #: the 0-based position in the input string where parsing failed, if known
+        self.position = position
+        #: the digit grouping pattern expected for the locale (e.g. '#,##0'), if known
+        self.expected_grouping = expected_grouping
 
 
 SPACE_CHARS = {
@@ -1153,18 +1165,36 @@ def parse_decimal(
         ...
     NumberFormatError: '2,109,998' is not a valid decimal number
 
-    If `strict` is set to `True` and the given string contains a number
-    formatted in an irregular way, an exception is raised:
+    If `strict` is set to `True`, the string is validated against the number
+    format of the locale and the given `numbering_system`: the digit grouping,
+    the decimal and sign symbols, and any whitespace must all be exactly where
+    the locale's format expects them.  Non-Latin digits are first mapped to
+    their ASCII equivalents according to the numbering system, and the
+    grouping is validated afterwards, so Indian-style grouping is distinguished
+    from Western grouping:
+
+    >>> parse_decimal('12,34,567', locale='hi_IN', strict=True)
+    Decimal('1234567')
+    >>> parse_decimal('1,234,567', locale='hi_IN', strict=True)
+    Traceback (most recent call last):
+        ...
+    NumberFormatError: '1,234,567' is not a properly formatted decimal number: invalid digit grouping at position 1 (expected grouping '#,##,##0'). Did you mean '12,34,567'?
 
     >>> parse_decimal('30.00', locale='de', strict=True)
     Traceback (most recent call last):
         ...
-    NumberFormatError: '30.00' is not a properly formatted decimal number. Did you mean '3.000'? Or maybe '30,00'?
+    NumberFormatError: '30.00' is not a properly formatted decimal number: invalid digit grouping at position 2 (expected grouping '#,##0'). Did you mean '3.000'? Or maybe '30,00'?
 
     >>> parse_decimal('0.00', locale='de', strict=True)
     Traceback (most recent call last):
         ...
-    NumberFormatError: '0.00' is not a properly formatted decimal number. Did you mean '0'?
+    NumberFormatError: '0.00' is not a properly formatted decimal number: invalid digit grouping at position 1 (expected grouping '#,##0'). Did you mean '0'?
+
+    In strict mode, superfluous groups, mixed local and ASCII symbols,
+    misplaced bidi control characters, trailing characters, and the special
+    values NaN and Infinity are all rejected.  The raised
+    `NumberFormatError` carries the failing `position` in the input string
+    and the `expected_grouping` pattern for the locale.
 
     :param string: the string to parse
     :param locale: the `Locale` object or locale identifier. Defaults to the system numeric locale.
@@ -1180,7 +1210,23 @@ def parse_decimal(
     group_symbol = get_group_symbol(locale, numbering_system=numbering_system)
     decimal_symbol = get_decimal_symbol(locale, numbering_system=numbering_system)
 
-    if not strict and (
+    if strict:
+        try:
+            return _strict_parse_decimal(string, locale, numbering_system=numbering_system)
+        except NumberFormatError as exc:
+            suggestions, hint = _strict_decimal_suggestions(
+                string,
+                locale,
+                numbering_system=numbering_system,
+            )
+            raise NumberFormatError(
+                f'{string!r} is not a properly formatted decimal number: {exc}.{hint}',
+                suggestions=suggestions or None,
+                position=exc.position,
+                expected_grouping=exc.expected_grouping,
+            ) from exc
+
+    if (
         group_symbol in SPACE_CHARS  # if the grouping symbol is a kind of space,
         and group_symbol not in string  # and the string to be parsed does not contain it,
         # but it does contain any other kind of space instead,
@@ -1190,47 +1236,224 @@ def parse_decimal(
         string = SPACE_CHARS_RE.sub(group_symbol, string)
 
     try:
-        parsed = decimal.Decimal(string.replace(group_symbol, '').replace(decimal_symbol, '.'))
+        return decimal.Decimal(string.replace(group_symbol, '').replace(decimal_symbol, '.'))
     except decimal.InvalidOperation as exc:
         raise NumberFormatError(f"{string!r} is not a valid decimal number") from exc
-    if strict and group_symbol in string:
-        proper = format_decimal(
-            parsed,
-            locale=locale,
-            decimal_quantization=False,
-            numbering_system=numbering_system,
+
+
+def _expected_grouping_pattern(grouping: tuple[int, int]) -> str:
+    """Render a grouping tuple as a number-pattern-like string.
+
+    >>> _expected_grouping_pattern((3, 3))
+    '#,##0'
+    >>> _expected_grouping_pattern((3, 2))
+    '#,##,##0'
+    >>> _expected_grouping_pattern((1000, 1000))
+    '#0'
+    """
+    primary, secondary = grouping
+    if primary >= 1000:
+        return '#0'
+    if secondary == primary:
+        return '#' + ',' + '#' * (primary - 1) + '0'
+    return '#' + ',' + '#' * secondary + ',' + '#' * (primary - 1) + '0'
+
+
+def _decimal_digit_value(char: str) -> int | None:
+    """Return the decimal value of a single Unicode decimal digit, or `None`.
+
+    >>> _decimal_digit_value('4')
+    4
+    >>> _decimal_digit_value(',') is None
+    True
+    """
+    if '0' <= char <= '9':
+        return ord(char) - ord('0')
+    try:
+        return unicodedata.decimal(char)
+    except (TypeError, ValueError):
+        return None
+
+
+def _strict_parse_decimal(
+    string: str,
+    locale: Locale,
+    *,
+    numbering_system: Literal['default'] | str,
+) -> decimal.Decimal:
+    """Parse a localized decimal string, strictly validating its format.
+
+    The string is checked against the digit grouping, decimal symbol, sign
+    symbols and whitespace rules of the locale and numbering system.  Digits
+    of a non-Latin numbering system are mapped to their ASCII equivalents
+    before the grouping is validated.  Returns a `decimal.Decimal`; the
+    value never passes through a float.
+
+    :raise NumberFormatError: if the string is not a properly formatted
+                              decimal number.  The exception carries the
+                              failing ``position`` and the locale's
+                              ``expected_grouping`` pattern.
+    """
+    group_symbol = get_group_symbol(locale, numbering_system=numbering_system)
+    decimal_symbol = get_decimal_symbol(locale, numbering_system=numbering_system)
+    plus_sign = get_plus_sign_symbol(locale, numbering_system=numbering_system)
+    minus_sign = get_minus_sign_symbol(locale, numbering_system=numbering_system)
+    number_symbols = _get_number_symbols(locale, numbering_system=numbering_system)
+    grouping = parse_pattern(locale.decimal_formats[None]).grouping
+    expected_grouping = _expected_grouping_pattern(grouping)
+
+    def fail(reason: str, position: int) -> None:
+        raise NumberFormatError(
+            reason,
+            position=position,
+            expected_grouping=expected_grouping,
         )
-        if string != proper and proper != _remove_trailing_zeros_after_decimal(string, decimal_symbol):  # fmt: skip
-            try:
-                parsed_alt = decimal.Decimal(
-                    string.replace(decimal_symbol, '').replace(group_symbol, '.'),
-                )
-            except decimal.InvalidOperation as exc:
-                raise NumberFormatError(
-                    f"{string!r} is not a properly formatted decimal number. "
-                    f"Did you mean {proper!r}?",
-                    suggestions=[proper],
-                ) from exc
+
+    # An optional leading sign; both the locale's own sign symbols (which may
+    # embed bidi control characters) and plain ASCII signs are accepted.
+    negative = False
+    rest = string
+    for candidate in sorted({minus_sign, plus_sign, '-', '+'}, key=len, reverse=True):
+        if rest.startswith(candidate):
+            negative = candidate in (minus_sign, '-')
+            rest = rest[len(candidate):]
+            break
+    sign_length = len(string) - len(rest)
+
+    # NaN and Infinity must not silently become ordinary numbers.
+    non_finite = {
+        number_symbols.get('nan', 'NaN'),
+        number_symbols.get('infinity', '\u221e'),
+        'NaN',
+        'Infinity',
+        '\u221e',
+    }
+    if rest in non_finite or rest.lower() in ('nan', 'inf', 'infinity'):
+        fail('expected a finite decimal number', sign_length)
+
+    if not rest:
+        fail('expected a number', sign_length)
+
+    int_runs: list[str] = []
+    frac_digits: list[str] = []
+    current: list[str] = []
+    group_positions: list[int] = []
+    seen_decimal = False
+    decimal_position = -1
+    digit_block_zero: int | None = None
+
+    for offset, char in enumerate(rest):
+        position = sign_length + offset
+        value = _decimal_digit_value(char)
+        if value is not None:
+            # Map non-Latin digits to ASCII; mixing digit systems (including
+            # mixing ASCII and non-ASCII digits) is rejected.
+            block_zero = ord(char) - value
+            if digit_block_zero is None:
+                digit_block_zero = block_zero
+            elif digit_block_zero != block_zero:
+                fail(f'mixed digit systems at position {position}', position)
+            (frac_digits if seen_decimal else current).append(str(value))
+        elif char == group_symbol and not seen_decimal:
+            if not current:
+                fail(f'unexpected group separator at position {position}', position)
+            int_runs.append(''.join(current))
+            current = []
+            group_positions.append(position)
+        elif char == decimal_symbol and not seen_decimal:
+            if not current and not int_runs:
+                fail(f'missing integer digits before decimal separator at position {position}', position)
+            int_runs.append(''.join(current))
+            current = []
+            seen_decimal = True
+            decimal_position = position
+        elif char == group_symbol:
+            fail(f'group separator is not allowed in the fractional part at position {position}', position)
+        elif char == decimal_symbol:
+            fail(f'duplicate decimal separator at position {position}', position)
+        else:
+            fail(f'unexpected character {char!r} at position {position}', position)
+
+    if seen_decimal:
+        if not frac_digits:
+            fail(f'missing fractional digits after decimal separator at position {decimal_position}', decimal_position)
+    else:
+        int_runs.append(''.join(current))
+
+    if group_positions:
+        primary, secondary = grouping
+        if primary >= 1000:
+            fail(f"digit grouping is not used for locale '{locale}'", group_positions[0])
+        lengths = [len(run) for run in int_runs]
+        bad_position: int | None = None
+        if lengths[-1] != primary:
+            bad_position = group_positions[-1]
+        else:
+            for index, length in enumerate(lengths[1:-1], 1):
+                if length != secondary:
+                    bad_position = group_positions[index - 1]
+                    break
             else:
-                proper_alt = format_decimal(
-                    parsed_alt,
-                    locale=locale,
-                    decimal_quantization=False,
-                    numbering_system=numbering_system,
-                )
-                if proper_alt == proper:
-                    raise NumberFormatError(
-                        f"{string!r} is not a properly formatted decimal number. "
-                        f"Did you mean {proper!r}?",
-                        suggestions=[proper],
-                    )
-                else:
-                    raise NumberFormatError(
-                        f"{string!r} is not a properly formatted decimal number. "
-                        f"Did you mean {proper!r}? Or maybe {proper_alt!r}?",
-                        suggestions=[proper, proper_alt],
-                    )
+                if not 1 <= lengths[0] <= secondary:
+                    bad_position = group_positions[0]
+        if bad_position is not None:
+            fail(
+                f'invalid digit grouping at position {bad_position} '
+                f'(expected grouping {expected_grouping!r})',
+                bad_position,
+            )
+
+    normalized = ''.join(int_runs)
+    if seen_decimal:
+        normalized += '.' + ''.join(frac_digits)
+    if negative:
+        normalized = '-' + normalized
+    parsed = decimal.Decimal(normalized)
+    if not parsed.is_finite():
+        fail('expected a finite decimal number', sign_length)
     return parsed
+
+
+def _strict_decimal_suggestions(
+    string: str,
+    locale: Locale,
+    *,
+    numbering_system: Literal['default'] | str,
+) -> tuple[list[str], str]:
+    """Compute reformatting suggestions for a string rejected by strict parsing.
+
+    Returns a tuple of the suggestion list and a sentence fragment
+    (e.g. \" Did you mean '1.111'?\") to append to the error message.
+    """
+    group_symbol = get_group_symbol(locale, numbering_system=numbering_system)
+    decimal_symbol = get_decimal_symbol(locale, numbering_system=numbering_system)
+    try:
+        parsed = decimal.Decimal(string.replace(group_symbol, '').replace(decimal_symbol, '.'))
+    except decimal.InvalidOperation:
+        return [], ''
+    proper = format_decimal(
+        parsed,
+        locale=locale,
+        decimal_quantization=False,
+        numbering_system=numbering_system,
+    )
+    if string == proper or proper == _remove_trailing_zeros_after_decimal(string, decimal_symbol):
+        return [], ''
+    try:
+        parsed_alt = decimal.Decimal(
+            string.replace(decimal_symbol, '').replace(group_symbol, '.'),
+        )
+    except decimal.InvalidOperation:
+        return [proper], f' Did you mean {proper!r}?'
+    proper_alt = format_decimal(
+        parsed_alt,
+        locale=locale,
+        decimal_quantization=False,
+        numbering_system=numbering_system,
+    )
+    if proper_alt == proper:
+        return [proper], f' Did you mean {proper!r}?'
+    return [proper, proper_alt], f' Did you mean {proper!r}? Or maybe {proper_alt!r}?'
 
 
 def _remove_trailing_zeros_after_decimal(string: str, decimal_symbol: str) -> str:
