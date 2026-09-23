@@ -279,6 +279,28 @@ def test_compile_catalog_explicit(tmp_path):
     assert mo_file.exists()
 
 
+def test_compile_catalog_with_python_brace_format_errors(tmp_path):
+    """
+    Test that `compile` reports python-brace-format errors in translations.
+    """
+    po_file = tmp_path / 'temp.po'
+    po_file.write_text(
+        '#, python-brace-format\n'
+        'msgid "Hello {name}!"\n'
+        'msgstr "Hallo {nam}!"\n',
+    )
+    mo_file = tmp_path / 'temp.mo'
+    cmdinst = configure_cli_command([  # fmt: skip
+        'compile',
+        '--use-fuzzy',
+        '-i', str(po_file),
+        '-o', str(mo_file),
+        '-l', 'de_DE',
+    ])
+    assert cmdinst.run() == 1  # the error was reported
+    assert mo_file.exists()  # but the catalog was still compiled
+
+
 @pytest.mark.parametrize("explicit_locale", (None, 'fi_FI'), ids=("implicit", "explicit"))
 def test_update_dir(tmp_path, explicit_locale: bool):
     """

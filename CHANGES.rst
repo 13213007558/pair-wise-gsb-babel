@@ -1,6 +1,16 @@
 Babel Changelog
 ===============
 
+Version 2.19.0 (unreleased)
+---------------------------
+
+Features
+~~~~~~~~
+
+* Messages: Add a `python-brace-format` checker that validates `str.format()` /
+  f-string placeholders (including attribute/index access, conversions and
+  nested format specs) against the msgid
+
 Version 2.18.0
 --------------
 

@@ -20,7 +20,12 @@ from babel.core import Locale, UnknownLocaleError
 from babel.dates import format_datetime
 from babel.messages import Message, checkers
 from babel.messages.catalog import TranslationError
-from babel.messages.checkers import _validate_format, python_format
+from babel.messages.checkers import (
+    _validate_format,
+    _validate_python_brace_format,
+    python_brace_format,
+    python_format,
+)
 from babel.messages.plurals import PLURALS
 from babel.messages.pofile import read_po
 from babel.util import LOCALTZ
@@ -396,3 +401,135 @@ def test__validate_format_invalid(msgid, msgstr, error):
 ])
 def test__validate_format_valid(msgid, msgstr):
     _validate_format(msgid, msgstr)
+
+
+@pytest.mark.parametrize(('msgid', 'msgstr'), [
+    ('foo', 'foo'),
+    ('{name}', '{name}'),
+    ('{name}', 'foo'),  # placeholders may be omitted
+    ('{a} {b}', '{b} {a}'),  # placeholders may be reordered
+    ('{0} {1}', '{1} {0}'),
+    ('{} {}', '{0} {1}'),  # automatic and explicit numbering are equivalent
+    ('{0} {name}', '{name} {0}'),  # positional and named may be mixed
+    ('{x:5d}', '{x:12d}'),  # width may change
+    ('{x:d}', '{x:x}'),  # compatible integer presentations
+    ('{x:f}', '{x:g}'),  # compatible float presentations
+    ('{x}', '{x:>10}'),  # presentation type may be added
+    ('{x:f}', '{x:.2f}'),  # precision may change
+    ('{x!r}', '{x!r}'),
+    ('{a[0].b}', '{a[0].b}'),
+    ('{{}}', '{{}}'),  # literal braces
+    ('{x:{w}}', '{x:{w}}'),
+    ('{price:{width}.{precision}f}', '{price:{width}.{precision}f}'),
+    ('{price:{width}.{precision}f}', '{price:>{width}}'),
+    ('{[0]}', '{[0]}'),  # automatic numbering with index access
+    ('{x:.{p}f}', '{x:.{p}f}'),  # nested placeholder in format spec
+])
+def test_python_brace_format_valid(msgid, msgstr):
+    _validate_python_brace_format(msgid, msgstr)
+
+
+@pytest.mark.parametrize(('msgid', 'msgstr', 'error'), [
+    ('{name}', '{nam}', "unknown placeholder 'nam'"),
+    ('{0}', '{1}', "unknown placeholder '1'"),
+    ('{} {}', '{} {} {}', "unknown placeholder '2'"),
+    ('{a.b}', '{a.c}', "unknown placeholder 'a.c'"),
+    ('{a[0]}', '{a[1]}', r"unknown placeholder 'a\[1\]'"),
+    ('{a[0].b}', '{a[0]}', r"unknown placeholder 'a\[0\]'"),
+    (
+        '{price:{width}.{precision}f}',
+        '{price:{widht}.{precision}f}',
+        "unknown placeholder 'widht' in format spec of 'price'",
+    ),
+    ('{x}', '{x:{w}}', "unknown placeholder 'w' in format spec of 'x'"),
+    ('{x!r}', '{x!s}', "incompatible conversion for placeholder 'x': expected 'r', got 's'"),
+    ('{x}', '{x!r}', "incompatible conversion for placeholder 'x': expected None, got 'r'"),
+    ('{x:d}', '{x:s}', "incompatible format for placeholder 'x': 's' and 'd' are not compatible"),
+    ('{x:d}', '{x:f}', "incompatible format for placeholder 'x': 'f' and 'd' are not compatible"),
+    ('{x:{w:d}}', '{x:{w:s}}', "incompatible format for placeholder 'w': 's' and 'd' are not compatible"),
+    ('{x:{w}}', '{x:{w!r}}', "incompatible conversion for placeholder 'w'"),
+    (
+        '{0} {}',
+        '{0} {}',
+        'invalid format string in msgid: format string mixes automatic and manual field numbering',
+    ),
+    (
+        '{0} {1}',
+        '{0} {}',
+        'invalid format string: format string mixes automatic and manual field numbering',
+    ),
+    ('{x}', '{x!z}', "invalid format string: unknown conversion specifier 'z'"),
+    ('{x}', '{x:{w:{p}}}', "invalid format string: nested replacement field in format spec of 'x'"),
+    ('{x}', '{x..y}', "invalid format string: empty attribute in field name 'x..y'"),
+    ('{x}', '{x[]}', r"invalid format string: empty index in field name 'x\[\]'"),
+    ('{x}', '{', "invalid format string: Single '{'"),
+    ('{x}', '{x]', "invalid format string: expected '}'"),
+])
+def test_python_brace_format_invalid(msgid, msgstr, error):
+    with pytest.raises(TranslationError, match=error):
+        _validate_python_brace_format(msgid, msgstr)
+
+
+def test_python_brace_format_checker_no_flag():
+    # messages not flagged as python-brace-format are not checked,
+    # even if the translation contains unbalanced braces
+    msg = Message('literal {{}} braces', 'unbalanced {')
+    python_brace_format(None, msg)
+
+
+def test_python_brace_format_checker():
+    msg = Message(
+        '{price:{width}.{precision}f}',
+        '{price:{widht}.{precision}f}',
+        flags=['python-brace-format'],
+    )
+    with pytest.raises(TranslationError, match="unknown placeholder 'widht' in format spec of 'price'"):
+        python_brace_format(None, msg)
+
+
+def test_python_brace_format_plural():
+    msg = Message(
+        ('{count} apple', '{count} apples'),
+        ('{count} Apfel', '{count} Äpfel', '{cont} Äpfel'),
+        flags=['python-brace-format'],
+    )
+    with pytest.raises(TranslationError, match=r"msgstr\[2\]: unknown placeholder 'cont'"):
+        python_brace_format(None, msg)
+
+
+def test_python_brace_format_empty_msgstr_skipped():
+    msg = Message(('{count} apple', '{count} apples'), ('', ''), flags=['python-brace-format'])
+    python_brace_format(None, msg)
+
+
+def test_python_brace_format_catalog_check():
+    # check that PO reading, flag detection and Catalog.check work together
+    po_file = '''\
+msgid ""
+msgstr ""
+"Project-Id-Version: TestProject 0.1\\n"
+"Content-Type: text/plain; charset=utf-8\\n"
+
+msgid "Hello {name}!"
+msgstr "Hallo {nam}!"
+
+msgid "{count} apple"
+msgid_plural "{count} apples"
+msgstr[0] "{count} Apfel"
+msgstr[1] "{cont} Äpfel"
+
+msgid "literal braces {{}}"
+msgstr "literal braces {{}}"
+'''.encode('utf-8')
+    catalog = read_po(BytesIO(po_file), locale='de_DE')
+    # the python-brace-format flag is detected automatically
+    assert catalog['Hello {name}!'].flags == {'python-brace-format'}
+    assert not catalog['literal braces {{}}'].flags
+    errors = list(catalog.check())
+    assert len(errors) == 2
+    message, message_errors = errors[0]
+    assert message.id == 'Hello {name}!'
+    assert str(message_errors[0]) == "unknown placeholder 'nam'"
+    message, message_errors = errors[1]
+    assert message.id == ('{count} apple', '{count} apples')
+    assert str(message_errors[0]) == "msgstr[1]: unknown placeholder 'cont'"
