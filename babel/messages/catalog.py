@@ -18,11 +18,12 @@ from difflib import SequenceMatcher
 from email import message_from_string
 from heapq import nlargest
 from string import Formatter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from babel import __version__ as VERSION
 from babel.core import Locale, UnknownLocaleError
 from babel.dates import format_datetime
+from babel.messages.icu_plural import ICUMessage
 from babel.messages.plurals import get_plural
 from babel.util import LOCALTZ, _cmp
 
@@ -852,6 +853,56 @@ class Catalog:
         :param context: the message context, or ``None`` for no context
         """
         return self._messages.get(self._key_for(id, context))
+
+    def icu_format(
+        self,
+        id: _MessageID,
+        context: str | None = None,
+        locale: Locale | str | None = None,
+        **variables: Any,
+    ) -> str:
+        """Format a message containing ICU plural syntax.
+
+        The message is looked up like with `get` (honoring the optional
+        gettext message context) and its translation is interpreted as
+        an ICU MessageFormat plural pattern; see
+        `babel.messages.icu_plural.ICUMessage` for the supported syntax.
+        If the message has no translation yet, the message ID itself is
+        used as the pattern, mirroring gettext fallback behavior.
+
+        Messages that do not use ICU plural syntax are returned with
+        plain ``{name}`` argument substitution applied; messages that
+        are never passed through this method are not affected at all.
+
+        >>> catalog = Catalog(locale='en')
+        >>> catalog.add('files', '{count, plural, =0 {No files} other {# files}}')
+        <Message ...>
+        >>> catalog.icu_format('files', count=0)
+        'No files'
+        >>> catalog.icu_format('files', count=3)
+        '3 files'
+
+        :param id: the message ID
+        :param context: the message context, or ``None`` for no context
+        :param locale: the locale to format with; defaults to the
+                       catalog's locale
+        :param variables: the arguments for the message, as keyword
+                          arguments
+        :raise KeyError: if the catalog has no message with the
+                         specified ID and context
+        :raise babel.messages.icu_plural.ICUPluralError: if the message
+                         cannot be parsed or evaluated
+        """
+        message = self.get(id, context)
+        if message is None:
+            raise KeyError(id)
+        string = message.string
+        if isinstance(string, (list, tuple)):
+            string = string[0] if string else ''
+        if not string:
+            fallback = message.id
+            string = fallback[0] if isinstance(fallback, (list, tuple)) else fallback
+        return ICUMessage.parse(string).format(variables, locale=locale or self.locale)
 
     def delete(self, id: _MessageID, context: str | None = None) -> None:
         """Delete the message with the specified ID and context.

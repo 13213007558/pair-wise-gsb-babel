@@ -1,6 +1,18 @@
 Babel Changelog
 ===============
 
+Version 2.19.0
+--------------
+
+(Unreleased)
+
+Features
+~~~~~~~~
+
+* Messages: Add ICU MessageFormat plural support via `babel.messages.icu_plural`,
+  with offsets, explicit ``=n`` selectors, CLDR plural categories and nested
+  plurals, and `Catalog.icu_format` to render such messages from catalogs
+
 Version 2.18.0
 --------------
 

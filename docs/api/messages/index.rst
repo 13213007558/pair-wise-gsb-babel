@@ -9,5 +9,6 @@ the API documentation shows those parts.
 
    catalog
    extract
+   icu_plural
    mofile
    pofile
