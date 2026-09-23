@@ -20,6 +20,10 @@ Basic Interface
 
 .. autofunction:: negotiate_locale
 
+.. autofunction:: negotiate_accept_language
+
+.. autofunction:: parse_accept_language
+
 
 Exceptions
 ----------

@@ -315,6 +315,140 @@ def test_negotiate_locale():
     assert core.negotiate_locale(['no', 'sv'], ['nb_NO', 'sv_SE']) == 'nb_NO'
 
 
+def test_parse_accept_language():
+    assert core.parse_accept_language('fr-CA, fr;q=0.8, en;q=0.6, *;q=0') == [
+        ('fr-CA', 1.0), ('fr', 0.8), ('en', 0.6), ('*', 0.0),
+    ]
+    assert core.parse_accept_language('de-CH,de;q=0.9') == [
+        ('de-CH', 1.0), ('de', 0.9),
+    ]
+    assert core.parse_accept_language('') == []
+    assert core.parse_accept_language('   ') == []
+    # qvalues may use up to three decimal places
+    assert core.parse_accept_language('en;q=0.125') == [('en', 0.125)]
+    assert core.parse_accept_language('en;q=1.000') == [('en', 1.0)]
+
+
+def test_parse_accept_language_invalid():
+    # weights out of range or not matching the qvalue grammar
+    for value in ('en;q=1.5', 'en;q=2', 'en;q=0.1234', 'en;q=1.0001',
+                  'en;q=abc', 'en;q=', 'en;q', 'en;foo=0.5'):
+        with pytest.raises(ValueError):
+            core.parse_accept_language(value)
+    # malformed language ranges
+    for value in ('fr_CA', '-fr', 'fr-', 'fr--ca', 'fr;q=0.5,',
+                  'fr;q=0.5;x=1', 'thisisaverylongtag', 'fr-abcdefghi'):
+        with pytest.raises(ValueError):
+            core.parse_accept_language(value)
+
+
+def test_negotiate_accept_language():
+    available = ['en_US', 'fr_FR', 'fr_CA', 'de_DE']
+    assert core.negotiate_accept_language(
+        'fr-CA, fr;q=0.8, en;q=0.6, *;q=0', available) == 'fr_CA'
+    # without fr_CA, the fr range wins over en on qvalue
+    assert core.negotiate_accept_language(
+        'fr-CA, fr;q=0.8, en;q=0.6, *;q=0',
+        ['en_US', 'fr_FR', 'de_DE']) == 'fr_FR'
+    # the wildcard with q=0 excludes de_DE entirely
+    assert core.negotiate_accept_language(
+        'en;q=0.6, *;q=0', ['de_DE']) is None
+    # nothing matches at all
+    assert core.negotiate_accept_language('it', available) is None
+    assert core.negotiate_accept_language('', available) is None
+    assert core.negotiate_accept_language('en', []) is None
+
+
+def test_negotiate_accept_language_returns_available_identifier():
+    # the original string from the available list is returned unchanged
+    assert core.negotiate_accept_language('de-DE', ['de_de', 'de_at']) == 'de_de'
+    assert core.negotiate_accept_language('FR-ca', ['fr_CA']) == 'fr_CA'
+    assert core.negotiate_accept_language('de-CH', ['de_CH']) == 'de_CH'
+
+
+def test_negotiate_accept_language_qvalue_order():
+    # higher qvalue wins regardless of header order
+    assert core.negotiate_accept_language(
+        'en;q=0.6, fr;q=0.8', ['en', 'fr']) == 'fr'
+    # equal qvalues are decided by request order ...
+    assert core.negotiate_accept_language(
+        'en;q=0.8, fr;q=0.8', ['fr', 'en']) == 'en'
+    assert core.negotiate_accept_language(
+        'fr;q=0.8, en;q=0.8', ['en', 'fr']) == 'fr'
+    # ... and then by the order of the available list
+    assert core.negotiate_accept_language(
+        'fr;q=0.8', ['fr_CA', 'fr_FR']) == 'fr_CA'
+    assert core.negotiate_accept_language(
+        'fr;q=0.8', ['fr_FR', 'fr_CA']) == 'fr_FR'
+
+
+def test_negotiate_accept_language_duplicate_ranges():
+    # for identical ranges the first occurrence in the header governs
+    assert core.negotiate_accept_language(
+        'fr-CA;q=0.4, fr-CA;q=0.9, fr;q=0.5',
+        ['fr_CA', 'fr_FR']) == 'fr_FR'
+    assert core.negotiate_accept_language(
+        'fr-CA;q=0.9, fr-CA;q=0.4, fr;q=0.5',
+        ['fr_CA', 'fr_FR']) == 'fr_CA'
+
+
+def test_negotiate_accept_language_exclusion_specificity():
+    # an explicitly allowed fr-CA is not cancelled by a wider fr;q=0
+    assert core.negotiate_accept_language(
+        'fr-CA, fr;q=0', ['fr_CA', 'fr_FR']) == 'fr_CA'
+    # an explicitly excluded fr-CA cannot come back through fr or *
+    assert core.negotiate_accept_language(
+        'fr-CA;q=0, fr;q=0.8, *;q=0.5',
+        ['fr_CA', 'fr_FR', 'en_US']) == 'fr_FR'
+    assert core.negotiate_accept_language(
+        'fr-CA;q=0, fr;q=0.8, *;q=0.5', ['fr_CA']) is None
+    # a wildcard exclusion only leaves explicitly allowed ranges
+    assert core.negotiate_accept_language(
+        'en;q=0.9, *;q=0', ['en_US', 'de_DE']) == 'en_US'
+    assert core.negotiate_accept_language(
+        '*;q=0', ['en_US', 'de_DE']) is None
+
+
+def test_negotiate_accept_language_wildcard():
+    # the wildcard matches anything not matched by a more specific range
+    assert core.negotiate_accept_language(
+        '*', ['de_DE', 'en_US']) == 'de_DE'
+    assert core.negotiate_accept_language(
+        'en;q=0.9, *;q=0.1', ['de_DE', 'en_US']) == 'en_US'
+    assert core.negotiate_accept_language(
+        'en;q=0.9, *;q=0.1', ['de_DE', 'fr_FR']) == 'de_DE'
+
+
+def test_negotiate_accept_language_lookup_fallback():
+    # RFC 4647 lookup: ranges fall back to less specific subtags
+    assert core.negotiate_accept_language(
+        'zh-Hans-CN', ['zh_Hans']) == 'zh_Hans'
+    assert core.negotiate_accept_language(
+        'de-CH-1901', ['de_CH_1901', 'de_CH']) == 'de_CH_1901'
+    assert core.negotiate_accept_language(
+        'de-CH-1901', ['de_CH']) == 'de_CH'
+    # ... but fallback never crosses a conflicting script subtag
+    assert core.negotiate_accept_language('zh-Hans', ['zh_Hant']) is None
+    assert core.negotiate_accept_language(
+        'zh-Hant', ['zh_Hans', 'zh_Hant']) == 'zh_Hant'
+    assert core.negotiate_accept_language(
+        'zh', ['zh_Hant']) == 'zh_Hant'
+
+
+def test_negotiate_accept_language_aliases():
+    # the same aliases as negotiate_locale are applied, on both sides
+    assert core.negotiate_accept_language('no', ['nb_NO', 'sv_SE']) == 'nb_NO'
+    assert core.negotiate_accept_language('nb', ['no']) == 'no'
+    assert core.negotiate_accept_language(
+        'no', ['nb_NO'], aliases=None) is None
+
+
+def test_negotiate_accept_language_does_not_modify_available():
+    available = ['fr_FR', 'en_US']
+    core.negotiate_accept_language('en, fr;q=0.8', available)
+    assert available == ['fr_FR', 'en_US']
+
+
 def test_parse_locale():
     assert core.parse_locale('zh_CN') == ('zh', 'CN', None, None)
     assert core.parse_locale('zh_Hans_CN') == ('zh', 'CN', 'Hans', None)
