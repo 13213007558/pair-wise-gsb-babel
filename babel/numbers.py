@@ -24,8 +24,9 @@ from __future__ import annotations
 import datetime
 import decimal
 import re
+import unicodedata
 import warnings
-from typing import Any, Literal, cast, overload
+from typing import Any, Literal, NoReturn, cast, overload
 
 from babel.core import Locale, default_locale, get_global
 from babel.localedata import LocaleDataDict
@@ -1066,10 +1067,21 @@ def format_scientific(
 class NumberFormatError(ValueError):
     """Exception raised when a string cannot be parsed into a number."""
 
-    def __init__(self, message: str, suggestions: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        suggestions: list[str] | None = None,
+        *,
+        position: int | None = None,
+        expected: str | None = None,
+    ) -> None:
         super().__init__(message)
         #: a list of properly formatted numbers derived from the invalid input
         self.suggestions = suggestions
+        #: the position in the input string at which parsing failed, if known
+        self.position = position
+        #: the grouping pattern the input was expected to follow, if known
+        self.expected = expected
 
 
 SPACE_CHARS = {
@@ -1079,6 +1091,125 @@ SPACE_CHARS = {
 }
 
 SPACE_CHARS_RE = re.compile('|'.join(SPACE_CHARS))
+
+
+#: Bidi control characters that may legitimately appear within locale sign
+#: symbols, but are rejected anywhere else in strict parsing.
+_BIDI_FORMAT_CHARS = {
+    '\u061c',  # Arabic letter mark
+    '\u200e',  # Left-to-right mark
+    '\u200f',  # Right-to-left mark
+    '\u202a',  # Left-to-right embedding
+    '\u202b',  # Right-to-left embedding
+    '\u202c',  # Pop directional formatting
+    '\u202d',  # Left-to-right override
+    '\u202e',  # Right-to-left override
+    '\u2066',  # Left-to-right isolate
+    '\u2067',  # Right-to-left isolate
+    '\u2068',  # First strong isolate
+    '\u2069',  # Pop directional isolate
+}
+
+#: Zero digit codepoints for the CLDR numbering systems known to Babel's
+#: locale data. The ten digits of each system occupy consecutive codepoints
+#: starting at the given zero digit. Numbering systems added in Unicode
+#: versions newer than this table (as well as ``hanidec``, whose digits are
+#: not consecutive) are handled specially in `_get_numbering_system_digits`.
+_NUMBERING_SYSTEM_ZERO_DIGITS = {
+    'latn': 0x0030,
+    'adlm': 0x1E950,
+    'ahom': 0x11730,
+    'arab': 0x0660,
+    'arabext': 0x06F0,
+    'bali': 0x1B50,
+    'beng': 0x09E6,
+    'bhks': 0x11C50,
+    'brah': 0x11066,
+    'cakm': 0x11136,
+    'cham': 0xAA50,
+    'deva': 0x0966,
+    'diak': 0x11950,
+    'fullwide': 0xFF10,
+    'gong': 0x11DA0,
+    'gonm': 0x11D50,
+    'gujr': 0x0AE6,
+    'guru': 0x0A66,
+    'hmng': 0x16B50,
+    'hmnp': 0x1E140,
+    'java': 0xA9D0,
+    'kali': 0xA900,
+    'kawi': 0x11F50,
+    'khmr': 0x17E0,
+    'knda': 0x0CE6,
+    'lana': 0x1A80,
+    'lanatham': 0x1A90,
+    'laoo': 0x0ED0,
+    'lepc': 0x1C40,
+    'limb': 0x1946,
+    'mathbold': 0x1D7CE,
+    'mathdbl': 0x1D7D8,
+    'mathmono': 0x1D7F6,
+    'mathsanb': 0x1D7EC,
+    'mathsans': 0x1D7E2,
+    'mlym': 0x0D66,
+    'modi': 0x11650,
+    'mong': 0x1810,
+    'mroo': 0x16A60,
+    'mtei': 0xABF0,
+    'mymr': 0x1040,
+    'mymrshan': 0x1090,
+    'mymrtlng': 0xA9F0,
+    'nagm': 0x1E4F0,
+    'newa': 0x11450,
+    'nkoo': 0x07C0,
+    'olck': 0x1C50,
+    'orya': 0x0B66,
+    'osma': 0x104A0,
+    'rohg': 0x10D30,
+    'saur': 0xA8D0,
+    'segment': 0x1FBF0,
+    'shrd': 0x111D0,
+    'sind': 0x112F0,
+    'sinh': 0x0DE6,
+    'sora': 0x110F0,
+    'sund': 0x1BB0,
+    'takr': 0x116C0,
+    'talu': 0x19D0,
+    'tamldec': 0x0BE6,
+    'telu': 0x0C66,
+    'thai': 0x0E50,
+    'tibt': 0x0F20,
+    'tirh': 0x114D0,
+    'tnsa': 0x16AC0,
+    'vaii': 0xA620,
+    'wara': 0x118E0,
+    'wcho': 0x1E2F0,
+}
+
+#: Numbering systems whose digits are not ten consecutive codepoints.
+_NUMBERING_SYSTEM_SPECIAL_DIGITS = {
+    'hanidec': '〇一二三四五六七八九',
+}
+
+_numbering_system_digits_cache: dict[str, str | None] = {}
+
+
+def _get_numbering_system_digits(numbering_system: str) -> str | None:
+    """Return the ten digits (zero through nine) of a numbering system.
+
+    Returns `None` if the numbering system is not known to Babel.
+    """
+    try:
+        return _numbering_system_digits_cache[numbering_system]
+    except KeyError:
+        pass
+    if numbering_system in _NUMBERING_SYSTEM_SPECIAL_DIGITS:
+        digits: str | None = _NUMBERING_SYSTEM_SPECIAL_DIGITS[numbering_system]
+    else:
+        zero = _NUMBERING_SYSTEM_ZERO_DIGITS.get(numbering_system)
+        digits = ''.join(chr(zero + i) for i in range(10)) if zero is not None else None
+    _numbering_system_digits_cache[numbering_system] = digits
+    return digits
 
 
 def parse_number(
@@ -1166,10 +1297,41 @@ def parse_decimal(
         ...
     NumberFormatError: '0.00' is not a properly formatted decimal number. Did you mean '0'?
 
+    In strict mode the string is validated against the locale's grouping
+    pattern, decimal and sign symbols, whitespace rules, and the digits of
+    the locale's numbering system.  Indian-style grouping is honored:
+
+    >>> parse_decimal('12,34,567', locale='hi_IN', strict=True)
+    Decimal('1234567')
+    >>> parse_decimal('1,234,567', locale='hi_IN', strict=True)
+    Traceback (most recent call last):
+        ...
+    NumberFormatError: '1,234,567' is not a properly formatted decimal number. Did you mean '12,34,567'?
+
+    Native digits of the locale's numbering system are mapped to ASCII
+    digits before the grouping is validated:
+
+    >>> parse_decimal('١٬٢٣٤٫٥', locale='ar_EG', numbering_system='default', strict=True)
+    Decimal('1234.5')
+
+    Mixed symbol sets, superfluous or misplaced grouping separators, stray
+    bidi control characters, trailing characters, and non-finite values
+    such as NaN and Infinity are rejected in strict mode.  The raised
+    `NumberFormatError` carries the failing ``position`` and the
+    ``expected`` grouping pattern:
+
+    >>> try:
+    ...     parse_decimal('1,234,567', locale='hi_IN', strict=True)
+    ... except NumberFormatError as exc:
+    ...     print(exc.position, exc.expected)
+    2 #,##,##0.###
+
     :param string: the string to parse
     :param locale: the `Locale` object or locale identifier. Defaults to the system numeric locale.
     :param strict: controls whether numbers formatted in a weird way are
-                   accepted or rejected
+                   accepted or rejected.  In strict mode the grouping,
+                   symbols, digits, and whitespace of the input are
+                   validated against the locale and numbering system.
     :param numbering_system: The numbering system used for formatting number symbols. Defaults to "latn".
                              The special value "default" will use the default numbering system of the locale.
     :raise NumberFormatError: if the string can not be converted to a
@@ -1180,7 +1342,16 @@ def parse_decimal(
     group_symbol = get_group_symbol(locale, numbering_system=numbering_system)
     decimal_symbol = get_decimal_symbol(locale, numbering_system=numbering_system)
 
-    if not strict and (
+    if strict:
+        return _parse_decimal_strict(
+            string,
+            locale,
+            numbering_system=numbering_system,
+            group_symbol=group_symbol,
+            decimal_symbol=decimal_symbol,
+        )
+
+    if (
         group_symbol in SPACE_CHARS  # if the grouping symbol is a kind of space,
         and group_symbol not in string  # and the string to be parsed does not contain it,
         # but it does contain any other kind of space instead,
@@ -1190,47 +1361,245 @@ def parse_decimal(
         string = SPACE_CHARS_RE.sub(group_symbol, string)
 
     try:
-        parsed = decimal.Decimal(string.replace(group_symbol, '').replace(decimal_symbol, '.'))
+        return decimal.Decimal(string.replace(group_symbol, '').replace(decimal_symbol, '.'))
     except decimal.InvalidOperation as exc:
         raise NumberFormatError(f"{string!r} is not a valid decimal number") from exc
-    if strict and group_symbol in string:
-        proper = format_decimal(
-            parsed,
-            locale=locale,
-            decimal_quantization=False,
-            numbering_system=numbering_system,
+
+
+def _strict_grouping_suggestions(
+    string: str,
+    locale: Locale,
+    *,
+    numbering_system: Literal["default"] | str,
+    group_symbol: str,
+    decimal_symbol: str,
+) -> list[str] | None:
+    """Derive properly formatted suggestions for a mis-grouped number string.
+
+    Returns `None` if no sensible suggestions can be derived from the input.
+    """
+    try:
+        parsed = decimal.Decimal(string.replace(group_symbol, '').replace(decimal_symbol, '.'))
+    except decimal.InvalidOperation:
+        return None
+    proper = format_decimal(
+        parsed,
+        locale=locale,
+        decimal_quantization=False,
+        numbering_system=numbering_system,
+    )
+    if string == proper or proper == _remove_trailing_zeros_after_decimal(
+        string, decimal_symbol,
+    ):
+        return None
+    try:
+        parsed_alt = decimal.Decimal(
+            string.replace(decimal_symbol, '').replace(group_symbol, '.'),
         )
-        if string != proper and proper != _remove_trailing_zeros_after_decimal(string, decimal_symbol):  # fmt: skip
-            try:
-                parsed_alt = decimal.Decimal(
-                    string.replace(decimal_symbol, '').replace(group_symbol, '.'),
-                )
-            except decimal.InvalidOperation as exc:
-                raise NumberFormatError(
+    except decimal.InvalidOperation:
+        return [proper]
+    proper_alt = format_decimal(
+        parsed_alt,
+        locale=locale,
+        decimal_quantization=False,
+        numbering_system=numbering_system,
+    )
+    if proper_alt == proper:
+        return [proper]
+    return [proper, proper_alt]
+
+
+def _parse_decimal_strict(
+    string: str,
+    locale: Locale,
+    *,
+    numbering_system: Literal["default"] | str,
+    group_symbol: str,
+    decimal_symbol: str,
+) -> decimal.Decimal:
+    """Parse a localized decimal string, strictly validating its format.
+
+    The string is validated against the locale's grouping pattern, decimal
+    and sign symbols, whitespace rules, and the digits of the locale's
+    numbering system.  The value is built as a `decimal.Decimal` directly
+    from the validated digits, without passing through `float`.
+
+    :raise NumberFormatError: if the string is not a properly formatted
+                              decimal number.  The exception carries the
+                              failing ``position`` and the ``expected``
+                              grouping pattern.
+    """
+    resolved_ns = _get_numbering_system(locale, numbering_system)
+    plus_sign = get_plus_sign_symbol(locale, numbering_system=numbering_system)
+    minus_sign = get_minus_sign_symbol(locale, numbering_system=numbering_system)
+    pattern = locale.decimal_formats[None]
+    primary_group, secondary_group = pattern.grouping
+    expected = pattern.pattern
+
+    def fail(detail: str, position: int) -> NoReturn:
+        raise NumberFormatError(
+            f"{string!r} is not a properly formatted decimal number: {detail}",
+            position=position,
+            expected=expected,
+        )
+
+    def grouping_fail(detail: str, position: int) -> NoReturn:
+        suggestions = _strict_grouping_suggestions(
+            string,
+            locale,
+            numbering_system=numbering_system,
+            group_symbol=group_symbol,
+            decimal_symbol=decimal_symbol,
+        )
+        if suggestions:
+            if len(suggestions) == 1:
+                message = (
                     f"{string!r} is not a properly formatted decimal number. "
-                    f"Did you mean {proper!r}?",
-                    suggestions=[proper],
-                ) from exc
-            else:
-                proper_alt = format_decimal(
-                    parsed_alt,
-                    locale=locale,
-                    decimal_quantization=False,
-                    numbering_system=numbering_system,
+                    f"Did you mean {suggestions[0]!r}?"
                 )
-                if proper_alt == proper:
-                    raise NumberFormatError(
-                        f"{string!r} is not a properly formatted decimal number. "
-                        f"Did you mean {proper!r}?",
-                        suggestions=[proper],
-                    )
-                else:
-                    raise NumberFormatError(
-                        f"{string!r} is not a properly formatted decimal number. "
-                        f"Did you mean {proper!r}? Or maybe {proper_alt!r}?",
-                        suggestions=[proper, proper_alt],
-                    )
-    return parsed
+            else:
+                message = (
+                    f"{string!r} is not a properly formatted decimal number. "
+                    f"Did you mean {suggestions[0]!r}? Or maybe {suggestions[1]!r}?"
+                )
+            raise NumberFormatError(
+                message,
+                suggestions=suggestions,
+                position=position,
+                expected=expected,
+            )
+        fail(detail, position)
+
+    # An optional leading sign, either the locale's own sign symbol
+    # (which may carry a bidi control prefix) or the plain ASCII sign.
+    sign = ''
+    start = 0
+    for symbol, char in ((minus_sign, '-'), (plus_sign, '+')):
+        if symbol and string.startswith(symbol):
+            sign, start = char, len(symbol)
+            break
+    else:
+        if string.startswith(('-', '+')):
+            sign, start = string[0], 1
+
+    # NaN and Infinity are not decimal numbers and must not slip through
+    # as ones, however they are spelled.
+    number_symbols = _get_number_symbols(locale, numbering_system=numbering_system)
+    remainder = string[start:]
+    if remainder.lower() in {'nan', 'snan', 'inf', 'infinity'} or remainder in {
+        number_symbols.get('nan', 'NaN'),
+        get_infinity_symbol(locale, numbering_system=numbering_system),
+        '∞',
+    }:
+        fail('not a finite decimal number', start)
+
+    # Digits are accepted in ASCII form (as produced by the formatters) and
+    # in the locale numbering system's own digits, but not mixed together.
+    digit_maps: list[dict[str, str]] = [{str(i): str(i) for i in range(10)}]
+    native_digits = _get_numbering_system_digits(resolved_ns)
+    if native_digits is not None and native_digits != '0123456789':
+        digit_maps.append({char: str(i) for i, char in enumerate(native_digits)})
+
+    int_chars: list[
+        tuple[str | None, int]
+    ] = []  # (mapped digit or None for a group separator, position)
+    frac_chars: list[tuple[str, int]] = []
+    in_fraction = False
+    decimal_pos: int | None = None
+    digit_family: int | None = None
+    i = start
+    while i < len(string):
+        char = string[i]
+        mapped: str | None = None
+        family: int | None = None
+        for family_index, digit_map in enumerate(digit_maps):
+            if char in digit_map:
+                mapped, family = digit_map[char], family_index
+                break
+        if mapped is None and native_digits is None and unicodedata.category(char) == 'Nd':
+            # The numbering system is unknown to Babel; accept any single
+            # family of Unicode decimal digits.
+            value = unicodedata.decimal(char)
+            mapped, family = str(value), ord(char) - value + 2
+        if mapped is not None:
+            if digit_family is None:
+                digit_family = family
+            elif family != digit_family:
+                fail(f'mixed digit systems at position {i}', i)
+            if in_fraction:
+                frac_chars.append((mapped, i))
+            else:
+                int_chars.append((mapped, i))
+        elif char in _BIDI_FORMAT_CHARS:
+            fail(f'unexpected bidi control character at position {i}', i)
+        elif not in_fraction and char == group_symbol:
+            if not int_chars or int_chars[-1][0] is None:
+                grouping_fail(f'empty group at position {i}', i)
+            int_chars.append((None, i))
+        elif char == decimal_symbol:
+            if in_fraction:
+                fail(f'duplicate decimal separator at position {i}', i)
+            in_fraction = True
+            decimal_pos = i
+        elif in_fraction and char == group_symbol:
+            fail(f'grouping separator after decimal separator at position {i}', i)
+        elif unicodedata.category(char) == 'Nd':
+            fail(
+                f'digit {char!r} at position {i} does not belong to the '
+                f'{resolved_ns!r} numbering system',
+                i,
+            )
+        elif char in SPACE_CHARS:
+            fail(f'unexpected whitespace at position {i}', i)
+        else:
+            fail(f'unexpected character {char!r} at position {i}', i)
+        i += 1
+
+    int_digits = [char for char, _ in int_chars if char is not None]
+    if not int_digits:
+        fail('missing integer part', decimal_pos if decimal_pos is not None else start)
+    if in_fraction and not frac_chars:
+        fail(f'missing digits after decimal separator at position {decimal_pos}', decimal_pos)
+    if len(int_digits) > 1 and int_digits[0] == '0':
+        grouping_fail(f'leading zero at position {int_chars[0][1]}', int_chars[0][1])
+
+    separators = [position for char, position in int_chars if char is None]
+    if separators:
+        if primary_group >= 1000:
+            fail(
+                f'grouping separator not used by the {locale} decimal format '
+                f'at position {separators[0]}',
+                separators[0],
+            )
+        groups: list[list[tuple[str, int]]] = [[]]
+        for char, position in int_chars:
+            if char is None:
+                groups.append([])
+            else:
+                groups[-1].append((char, position))
+        # The rightmost group must match the primary grouping size, any
+        # middle groups the secondary size, and the leftmost group must
+        # not exceed the secondary size.
+        for index, group in enumerate(groups):
+            if not group:
+                grouping_fail(
+                    f'empty group at position {separators[index - 1]}', separators[index - 1],
+                )
+            size = len(group)
+            position = group[0][1]
+            if index == len(groups) - 1:
+                if size != primary_group:
+                    grouping_fail(f'improper grouping at position {position}', position)
+            elif index == 0:
+                if size > secondary_group:
+                    grouping_fail(f'improper grouping at position {position}', position)
+            elif size != secondary_group:
+                grouping_fail(f'improper grouping at position {position}', position)
+
+    value_string = sign + ''.join(int_digits)
+    if in_fraction:
+        value_string += '.' + ''.join(char for char, _ in frac_chars)
+    return decimal.Decimal(value_string)
 
 
 def _remove_trailing_zeros_after_decimal(string: str, decimal_symbol: str) -> str:

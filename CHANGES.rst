@@ -1,6 +1,20 @@
 Babel Changelog
 ===============
 
+Unreleased
+----------
+
+Features
+~~~~~~~~
+
+* Numbers: Rework `parse_decimal` strict mode to validate the input against
+  the locale's grouping pattern (including Indian-style 3,2 grouping),
+  decimal and sign symbols, whitespace rules, and the digits of the locale's
+  numbering system. Non-Latin digits are mapped before grouping validation,
+  and NaN, Infinity, and currency symbols are rejected in strict mode.
+  `NumberFormatError` now carries the failing ``position`` and the
+  ``expected`` grouping pattern.
+
 Version 2.18.0
 --------------
 
