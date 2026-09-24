@@ -10,13 +10,14 @@ Core locale representation and locale data access.
 
 from __future__ import annotations
 
+import decimal
 import os
 import pickle
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, Literal
 
 from babel import localedata
-from babel.plural import PluralRule
+from babel.plural import PluralRangeRule, PluralRule
 
 __all__ = [
     'Locale',
@@ -55,6 +56,7 @@ if TYPE_CHECKING:
 
 _global_data = None
 _default_plural_rule = PluralRule({})
+_default_plural_range_rule = PluralRangeRule()
 
 
 def _raise_no_data_error():
@@ -1029,6 +1031,29 @@ class Locale:
         'many'
         """
         return self._data.get('plural_form', _default_plural_rule)
+
+    @property
+    def plural_range_form(self) -> PluralRangeRule:
+        """Cardinal plural range combination rules for the locale."""
+        return self._data.get('plural_range_form', _default_plural_range_rule)
+
+    def plural_range_category(
+        self,
+        start: int | float | decimal.Decimal,
+        end: int | float | decimal.Decimal,
+    ) -> str:
+        """Return the cardinal plural category for the range ``start–end``.
+
+        Each endpoint is pluralized independently using its CLDR operands. The
+        resulting categories are then combined using this locale's CLDR plural
+        range table, including parent-locale inheritance and CLDR's default of
+        ``'other'`` for missing combinations. Reverse ranges retain their order,
+        and equal endpoints also use the range table.
+
+        >>> Locale.parse('ka').plural_range_category(2, 1)
+        'other'
+        """
+        return self.plural_range_form(self.plural_form(start), self.plural_form(end))
 
     @property
     def list_patterns(self) -> localedata.LocaleDataDict:

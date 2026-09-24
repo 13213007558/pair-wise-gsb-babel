@@ -231,6 +231,11 @@ def test_plural_form_property():
     assert Locale('ru').plural_form(100) == 'many'
 
 
+def test_plural_range_form_property():
+    assert Locale('en_US').plural_range_category(2, 1) == 'other'
+    assert Locale('sl').plural_range_category(1, 1) == 'few'
+
+
 def test_locale_provides_access_to_cldr_locale_data():
     locale = Locale('en', 'US')
     assert locale.display_name == 'English (United States)'

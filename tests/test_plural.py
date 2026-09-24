@@ -13,7 +13,7 @@ import decimal
 
 import pytest
 
-from babel import Locale, localedata, plural
+from babel import Locale, UnknownLocaleError, localedata, plural
 
 EPSILON = decimal.Decimal("0.0001")
 
@@ -139,6 +139,63 @@ def test_locales_with_no_plural_rules_have_default():
     assert pf(1) == 'other'
     assert pf(2) == 'other'
     assert pf(15) == 'other'
+
+
+def test_plural_range_rule_wildcards_and_default():
+    rule = plural.PluralRangeRule({'one': {None: 'other'}, None: {'one': 'one'}})
+    assert rule('one', 'few') == 'other'
+    assert rule('many', 'one') == 'one'
+    assert rule('many', 'few') == 'other'
+
+
+def test_locale_plural_range_uses_both_endpoints():
+    assert Locale.parse('ka').plural_range_category(2, 1) == 'other'
+    assert Locale.parse('ka').plural_range_category(1, 2) == 'one'
+    assert Locale.parse('sl').plural_range_category(1, 1) == 'few'
+    assert Locale.parse('ru').plural_range_category(1, 5) == 'many'
+
+
+def test_locale_plural_range_parent_fallback_and_missing_rule_default():
+    assert Locale.parse('en_US').plural_range_category(2, 1) == 'other'
+    assert Locale.parse('en_US').plural_range_category(1, 1) == 'other'
+    assert Locale.parse('ii').plural_range_category(1, 2) == 'other'
+
+
+def test_locale_plural_range_keeps_endpoint_order_and_decimal_precision():
+    locale = Locale.parse('lv')
+    assert Locale.parse('cs').plural_range_category(decimal.Decimal('1'), 2) == 'few'
+    assert Locale.parse('cs').plural_range_category(decimal.Decimal('1.0'), 2) == 'few'
+    assert locale.plural_range_category(
+        decimal.Decimal('0.10'),
+        decimal.Decimal('0.1'),
+    ) == 'one'
+    assert Locale.parse('ka').plural_range_category(2, 1) == 'other'
+    assert Locale.parse('ka').plural_range_category(1, 2) == 'one'
+
+
+def test_format_plural_range():
+    messages = {'other': '{0}–{1} days'}
+    assert plural.format_plural_range(2, 1, messages, locale='ka') == '2–1 days'
+
+
+def test_format_plural_range_keeps_decimal_precision():
+    messages = {'one': '{0}–{1} days'}
+    assert plural.format_plural_range(
+        decimal.Decimal('0.10'),
+        decimal.Decimal('0.1'),
+        messages,
+        locale='lv',
+    ) == '0.10–0.1 days'
+
+
+def test_format_plural_range_missing_message():
+    with pytest.raises(KeyError, match="'one'"):
+        plural.format_plural_range(1, 2, {'other': '{0}–{1}'}, locale='ka')
+
+
+def test_format_plural_range_unknown_locale():
+    with pytest.raises(UnknownLocaleError):
+        plural.format_plural_range(1, 2, {}, locale='xx_YY')
 
 
 WELL_FORMED_TOKEN_TESTS = (

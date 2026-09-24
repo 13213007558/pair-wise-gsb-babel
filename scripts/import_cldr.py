@@ -32,7 +32,7 @@ sys.path.insert(0, CHECKOUT_ROOT)
 from babel import dates, numbers
 from babel.dates import split_interval_pattern
 from babel.localedata import Alias
-from babel.plural import PluralRule
+from babel.plural import PluralRangeRule, PluralRule
 
 parse = ElementTree.parse
 weekdays = {'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4, 'sat': 5,
@@ -113,6 +113,22 @@ def _extract_plural_rules(file_path):
         pr = PluralRule(rules)
         for locale in elem.attrib['locales'].split():
             rule_dict[locale] = pr
+    return rule_dict
+
+
+def _extract_plural_range_rules(file_path):
+    rule_dict = {}
+    root = parse(file_path)
+    for elem in root.findall('.//plurals/pluralRanges'):
+        rules = {}
+        for range_elem in elem.findall('pluralRange'):
+            start = range_elem.attrib.get('start')
+            end = range_elem.attrib.get('end')
+            result = range_elem.attrib['result']
+            rules.setdefault(start, {})[end] = result
+        rule = PluralRangeRule(rules)
+        for locale in elem.attrib['locales'].split():
+            rule_dict[locale] = rule
     return rule_dict
 
 
@@ -384,6 +400,9 @@ def _process_local_datas(sup, srcdir, destdir, force=True, dump_json=False):
     # prepare the per-locale plural rules definitions
     plural_rules = _extract_plural_rules(os.path.join(srcdir, 'supplemental', 'plurals.xml'))
     ordinal_rules = _extract_plural_rules(os.path.join(srcdir, 'supplemental', 'ordinals.xml'))
+    plural_range_rules = _extract_plural_range_rules(
+        os.path.join(srcdir, 'supplemental', 'pluralRanges.xml'),
+    )
 
     filenames = os.listdir(os.path.join(srcdir, 'main'))
     filenames.remove('root.xml')
@@ -428,6 +447,8 @@ def _process_local_datas(sup, srcdir, destdir, force=True, dump_json=False):
 
         if locale_id in plural_rules:
             data['plural_form'] = plural_rules[locale_id]
+        if locale_id in plural_range_rules:
+            data['plural_range_form'] = plural_range_rules[locale_id]
         if locale_id in ordinal_rules:
             data['ordinal_form'] = ordinal_rules[locale_id]
         if locale_id in day_period_rules:

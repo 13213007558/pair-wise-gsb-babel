@@ -13,6 +13,13 @@ Basic Interface
 .. autoclass:: PluralRule
    :members:
 
+.. autoclass:: PluralRangeRule
+   :members:
+
+.. autofunction:: get_plural_range_category
+
+.. autofunction:: format_plural_range
+
 Conversion Functionality
 ------------------------
 

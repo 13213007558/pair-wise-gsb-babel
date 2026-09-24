@@ -19,6 +19,58 @@ _plural_tags = ('zero', 'one', 'two', 'few', 'many', 'other')
 _fallback_tag = 'other'
 
 
+def format_plural_range(
+    start: int | float | decimal.Decimal,
+    end: int | float | decimal.Decimal,
+    messages: Mapping[str, str],
+    *,
+    locale: Any = None,
+) -> str:
+    """Format a range using a message selected by the locale's cardinal range rules.
+
+    Each message is a Python format string with positional placeholders for the
+    endpoints, such as ``'{0}–{1} days'``. Decimal endpoints retain their given
+    value and visible fraction digits while the plural category is calculated.
+
+    :param start: the start of the range
+    :param end: the end of the range
+    :param messages: messages keyed by plural category
+    :param locale: the `Locale` object or locale identifier; if omitted, the
+                   current message locale, falling back to the numeric locale
+    :raise KeyError: if the selected plural category is missing from `messages`
+    :raise UnknownLocaleError: if `locale` cannot be resolved
+    """
+    category = get_plural_range_category(start, end, locale=locale)
+    return messages[category].format(start, end)
+
+
+def get_plural_range_category(
+    start: int | float | decimal.Decimal,
+    end: int | float | decimal.Decimal,
+    *,
+    locale: Any = None,
+) -> str:
+    """Return the cardinal plural category for a numeric range in `locale`.
+
+    The plural categories of both endpoints are calculated from their CLDR
+    operands before consulting the locale's CLDR plural range table. Reverse
+    ranges are not reordered or rejected; the start endpoint remains the first
+    argument. Equal endpoints are also passed through the range table. A locale
+    without an explicit range table defaults every range to ``'other'``, and a
+    missing range table entry also defaults to ``'other'``.
+
+    :param start: the start of the range
+    :param end: the end of the range
+    :param locale: the `Locale` object or locale identifier; if omitted, the
+                   current message locale, falling back to the numeric locale
+    :raise UnknownLocaleError: if `locale` cannot be resolved
+    """
+    from babel.core import Locale, default_locale
+
+    resolved_locale = Locale.parse(locale or default_locale(('LC_MESSAGES', 'LC_NUMERIC')))
+    return resolved_locale.plural_range_category(start, end)
+
+
 def extract_operands(
     source: float | decimal.Decimal,
 ) -> tuple[decimal.Decimal | int, int, int, int, int, int, Literal[0], Literal[0]]:
@@ -173,6 +225,60 @@ class PluralRule:
         if not hasattr(self, '_func'):
             self._func = to_python(self)
         return self._func(n)
+
+
+class PluralRangeRule:
+    """Represents CLDR cardinal plural range combination rules.
+
+    The mapping keys are ``(start, end)`` plural-category pairs. As specified
+    by the CLDR DTD, a wildcard ``None`` start or end matches any category, and
+    an entirely missing pair results in ``'other'``.
+    """
+
+    __slots__ = ('rules',)
+
+    def __init__(
+        self,
+        rules: Mapping[str | None, Mapping[str | None, str] | str] | None = None,
+    ) -> None:
+        normalized: dict[str | None, dict[str | None, str]] = {}
+        if rules is not None:
+            if not isinstance(rules, Mapping):
+                raise TypeError("Plural range rules must be a mapping")
+            for start, ends in rules.items():
+                self._validate_tag(start, allow_wildcard=True)
+                if isinstance(ends, str):
+                    ends = {None: ends}
+                elif not isinstance(ends, Mapping):
+                    raise TypeError("Plural range results must be a string or mapping")
+                normalized_ends: dict[str | None, str] = {}
+                for end, result in ends.items():
+                    self._validate_tag(end, allow_wildcard=True)
+                    self._validate_tag(result)
+                    normalized_ends[end] = result
+                normalized[start] = normalized_ends
+        self.rules = normalized
+
+    @staticmethod
+    def _validate_tag(tag: str | None, allow_wildcard: bool = False) -> None:
+        if (allow_wildcard and tag is None) or tag in _plural_tags:
+            return
+        raise ValueError(f"unknown plural tag {tag!r}")
+
+    def __call__(self, start: str, end: str) -> str:
+        """Return the result for endpoint plural categories `start` and `end`."""
+        self._validate_tag(start)
+        self._validate_tag(end)
+        end_rules = self.rules.get(start) or self.rules.get(None)
+        if end_rules is None:
+            return _fallback_tag
+        return end_rules.get(end) or end_rules.get(None) or _fallback_tag
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, PluralRangeRule) and self.rules == other.rules
+
+    def __repr__(self) -> str:
+        return f"<{type(self).__name__} {self.rules!r}>"
 
 
 def to_javascript(rule: Mapping[str, str] | Iterable[tuple[str, str]] | PluralRule) -> str:
