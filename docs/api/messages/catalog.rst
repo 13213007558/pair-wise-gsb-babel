@@ -20,6 +20,15 @@ Messages
 .. autoclass:: Message
    :members:
 
+Update Reports
+--------------
+
+.. autoclass:: UpdateReport
+   :members:
+
+.. autoclass:: FuzzyMatch
+   :members:
+
 Exceptions
 ----------
 

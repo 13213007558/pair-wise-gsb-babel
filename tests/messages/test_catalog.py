@@ -13,7 +13,9 @@
 import copy
 import datetime
 import pickle
-from io import StringIO
+from io import BytesIO, StringIO
+
+import pytest
 
 from babel.dates import UTC, format_datetime
 from babel.messages import catalog, pofile
@@ -601,3 +603,208 @@ msgid ""
 msgstr ""
 "POT-Creation-Date: 2007-04-01 15:30+0200\n"
     """))))
+def _greedy_steal_catalogs():
+    """Two similar old translations and two new messages, where greedy
+    matching hands the closest old translation to both new messages."""
+    template = catalog.Catalog()
+    template.add('Save file now', locations=[('main.py', 10)])
+    template.add('Save files', locations=[('main.py', 20)])
+    cat = catalog.Catalog(locale='de')
+    cat.add('Save file', 'Datei speichern',
+            locations=[('main.py', 1)], user_comments=['about save'])
+    cat.add('Save file to disk', 'Datei auf Platte speichern',
+            locations=[('main.py', 2)])
+    return cat, template
+
+
+def test_catalog_update_greedy_matching_reuses_old_message():
+    # The legacy per-message mode may hand the same old translation to
+    # several new messages; it stays available as ``matching='greedy'``.
+    cat, template = _greedy_steal_catalogs()
+    assert cat.update(template, matching='greedy') is None
+    assert cat['Save files'].string == 'Datei speichern'
+    assert cat['Save file now'].string == 'Datei speichern'
+
+
+def test_catalog_update_global_matching_one_to_one():
+    cat, template = _greedy_steal_catalogs()
+    report = cat.update(template, matching='global')
+    # Each old translation is assigned to exactly one new message, so the
+    # unique candidate for 'Save files' is not stolen by 'Save file now'.
+    assert cat['Save files'].string == 'Datei speichern'
+    assert cat['Save file now'].string == 'Datei auf Platte speichern'
+    assert cat['Save files'].fuzzy
+    assert cat['Save file now'].fuzzy
+    assert cat['Save files'].previous_id == ['Save file']
+    assert cat['Save file now'].previous_id == ['Save file to disk']
+    assert [(m.message.id, m.old_message.id) for m in report.fuzzy_matches] == [
+        ('Save file now', 'Save file to disk'),
+        ('Save files', 'Save file'),
+    ]
+    assert report.unmatched_new == []
+    assert report.unmatched_old == []
+    assert len(cat.obsolete) == 0
+
+
+def test_catalog_update_global_matching_po_roundtrip():
+    cat, template = _greedy_steal_catalogs()
+    cat.update(template, matching='global')
+    buf = BytesIO()
+    pofile.write_po(buf, cat, include_previous=True)
+    buf.seek(0)
+    reread = pofile.read_po(buf, locale='de')
+
+    save_files = reread.get('Save files')
+    assert save_files.string == 'Datei speichern'
+    assert save_files.fuzzy
+    assert save_files.locations == [('main.py', 20)]
+
+    save_now = reread.get('Save file now')
+    assert save_now.string == 'Datei auf Platte speichern'
+    assert save_now.fuzzy
+    assert save_now.locations == [('main.py', 10)]
+    # Comments (translator comments and previous msgids) travel with the
+    # message they belong to.
+    assert 'about save' in save_files.user_comments
+    assert '| msgid "Save file"' in save_files.user_comments
+    assert 'about save' not in save_now.user_comments
+    assert '| msgid "Save file to disk"' in save_now.user_comments
+
+
+def test_catalog_update_global_matching_report_unmatched():
+    cat = catalog.Catalog(locale='de')
+    cat.add('Delete file', 'Datei l\u00f6schen')
+    cat.add('Keep me', 'Behalten')
+    cat.add('Untranslated')
+    template = catalog.Catalog()
+    template.add('Delete file now')
+    template.add('Completely different text')
+    report = cat.update(template, matching='global')
+
+    assert cat['Delete file now'].string == 'Datei l\u00f6schen'
+    # Below the minimum score: stays untranslated instead of being
+    # forcibly matched to 'Keep me'.
+    assert not cat['Completely different text'].string
+    assert not cat['Completely different text'].fuzzy
+    assert [m.id for m in report.unmatched_new] == ['Completely different text']
+    # 'Keep me' was translated but not reused; 'Untranslated' was never a
+    # candidate, so it is not part of the report.
+    assert [m.id for m in report.unmatched_old] == ['Keep me']
+    assert 'Keep me' in cat.obsolete
+    assert 'Untranslated' in cat.obsolete
+    assert 'Delete file' not in cat.obsolete
+
+
+def test_catalog_update_global_matching_plural_compatibility():
+    cat = catalog.Catalog(locale='de')
+    cat.add(('strawberry', 'strawberries'), ('Erdbeere', 'Erdbeeren'))
+    cat.add('peach', 'Pfirsich')
+    cat.add(('peanut', 'peanuts'), ('Erdnuss', 'Erdn\u00fcsse'))
+    template = catalog.Catalog()
+    template.add('strawberries')
+    template.add(('peach fruit', 'peach fruits'))
+    template.add(('salted peanut', 'salted peanuts'))
+    report = cat.update(template, matching='global')
+    # Plural forms must be compatible: a plural old message is not a
+    # candidate for a singular new message (and vice versa), no matter
+    # how similar the message IDs are.
+    assert not cat['strawberries'].string
+    assert not any(cat['peach fruit'].string)
+    assert {m.id for m in report.unmatched_new} == {
+        'strawberries', ('peach fruit', 'peach fruits'),
+    }
+    assert {m.id for m in report.unmatched_old} == {
+        'peach', ('strawberry', 'strawberries'),
+    }
+    # A plural old message matches a plural new message just fine.
+    assert cat['salted peanut'].string == ('Erdnuss', 'Erdn\u00fcsse')
+    assert cat['salted peanut'].fuzzy
+
+
+def test_catalog_update_global_matching_placeholder_compatibility():
+    cat = catalog.Catalog(locale='de')
+    cat.add('Hello %(name)s!', 'Hallo %(name)s!')
+    cat.add('Bye {name}!', 'Tsch\u00fcss {name}!')
+    template = catalog.Catalog()
+    template.add('Hello %(user)s!')
+    template.add('Bye {user}!')
+    report = cat.update(template, matching='global')
+    # Different placeholders are not compatible, no matter how similar
+    # the message IDs are.
+    assert not cat['Hello %(user)s!'].string
+    assert not cat['Bye {user}!'].string
+    assert sorted(m.id for m in report.unmatched_old) == [
+        'Bye {name}!', 'Hello %(name)s!',
+    ]
+
+
+def test_catalog_update_global_matching_context_not_crossed_by_default():
+    template = catalog.Catalog()
+    template.add('Open now')
+    template.add('Open sesame', context='menu')
+
+    cat = catalog.Catalog(locale='de')
+    cat.add('Open', '\u00d6ffnen', context='button')
+    report = cat.update(template, matching='global')
+    # Different contexts do not cross-match by default.
+    assert not cat['Open now'].string
+    assert not cat.get('Open sesame', context='menu').string
+    assert [m.id for m in report.unmatched_old] == ['Open']
+
+    cat = catalog.Catalog(locale='de')
+    cat.add('Open', '\u00d6ffnen', context='button')
+    cat.add('Open sesame!', 'Sesam \u00f6ffne dich!', context='menu')
+    report = cat.update(template, matching='global', allow_cross_context=True)
+    assert cat['Open now'].string == '\u00d6ffnen'
+    assert cat['Open now'].fuzzy
+    # Same-context candidates are still matched within their context.
+    assert cat.get('Open sesame', context='menu').string == 'Sesam \u00f6ffne dich!'
+
+
+def test_catalog_update_global_matching_exact_matches_fixed_first():
+    cat = catalog.Catalog(locale='de')
+    cat.add('Save', 'Speichern')
+    template = catalog.Catalog()
+    template.add('Save')
+    template.add('Saves')
+    report = cat.update(template, matching='global')
+    assert cat['Save'].string == 'Speichern'
+    assert not cat['Save'].fuzzy
+    # 'Save' was fixed by the exact match, so no candidate is left for
+    # 'Saves' and it stays untranslated.
+    assert not cat['Saves'].string
+    assert [m.id for m in report.unmatched_new] == ['Saves']
+    assert report.unmatched_old == []
+
+
+def test_catalog_update_global_matching_custom_score_and_min_score():
+    template = catalog.Catalog()
+    template.add('abc')
+
+    cat = catalog.Catalog(locale='de')
+    cat.add('aaa', 'AAA')
+    cat.add('aab', 'AAB')
+    # Equal scores for both candidates: the stable tie-breaking rule
+    # prefers the earlier old catalog entry.
+    report = cat.update(template, matching='global', score=lambda new, old: 0.9)
+    assert cat['abc'].string == 'AAA'
+    assert cat['abc'].fuzzy
+    assert report.fuzzy_matches[0].score == 0.9
+    assert [m.id for m in report.unmatched_old] == ['aab']
+
+    cat = catalog.Catalog(locale='de')
+    cat.add('aaa', 'AAA')
+    report = cat.update(template, matching='global',
+                         score=lambda new, old: 0.9, min_score=0.95)
+    # The only candidate does not reach the minimum score.
+    assert not cat['abc'].string
+    assert [m.id for m in report.unmatched_new] == ['abc']
+    assert [m.id for m in report.unmatched_old] == ['aaa']
+
+
+def test_catalog_update_invalid_matching_mode():
+    cat = catalog.Catalog()
+    with pytest.raises(ValueError, match='unknown matching mode'):
+        cat.update(catalog.Catalog(), matching='bogus')
+    with pytest.raises(ValueError, match='not compatible'):
+        cat.update(catalog.Catalog(), matching='global', no_fuzzy_matching=True)

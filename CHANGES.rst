@@ -1,6 +1,20 @@
 Babel Changelog
 ===============
 
+Unreleased
+----------
+
+Features
+~~~~~~~~
+
+* Messages: Add an explicit global matching mode to ``Catalog.update``
+  (``matching='global'``) that assigns old translations to new messages
+  one-to-one, maximizing the total score over all compatible candidates
+  instead of matching each new message independently.  The mode supports
+  caller-provided minimum scores and scoring functions, and returns an
+  ``UpdateReport`` describing the applied matches and the new/old
+  messages that could not be assigned.
+
 Version 2.18.0
 --------------
 
