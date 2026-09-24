@@ -141,6 +141,54 @@ def test_locales_with_no_plural_rules_have_default():
     assert pf(15) == 'other'
 
 
+def test_plural_range_rule():
+    rule = plural.PluralRangeRule(
+        plural.PluralRule({'one': 'n is 1'}),
+        {('one', 'other'): 'other', ('other', 'one'): 'one'},
+    )
+    assert rule(1, 1) == 'one'  # no explicit ('one', 'one') -> end category
+    assert rule(1, 5) == 'other'
+    assert rule(5, 1) == 'one'
+    assert rule(2, 3) == 'other'  # no explicit ('other', 'other') -> end category
+
+
+def test_plural_range_rule_accepts_rule_dict():
+    rule = plural.PluralRangeRule({'one': 'n is 1'})
+    assert rule.cardinal_rule(1) == 'one'
+    assert rule.ranges == {}
+    assert rule(1, 2) == 'other'  # no ranges at all -> end category
+
+
+def test_plural_range_rule_decimal_visible_fraction_digits():
+    # German cardinal rules require v=0 for 'one', so Decimal('1.0') is 'other'
+    rule = plural.PluralRangeRule(
+        {'one': 'n is 1 and v is 0'},
+        {('other', 'one'): 'one'},
+    )
+    assert rule(2, 1) == 'one'
+    assert rule(2, decimal.Decimal('1.0')) == 'other'
+    assert rule(decimal.Decimal('1.0'), 2) == 'other'
+
+
+def test_plural_range_rule_reversed_range_not_reordered():
+    rule = plural.PluralRangeRule(
+        {'one': 'n is 1'},
+        {('other', 'one'): 'one'},
+    )
+    assert rule(5, 1) == 'one'  # evaluated as given, not swapped
+    assert rule(1, 5) == 'other'
+
+
+def test_plural_range_rule_pickle():
+    import pickle
+
+    rule = plural.PluralRangeRule({'one': 'n is 1'}, {('one', 'other'): 'other'})
+    revived = pickle.loads(pickle.dumps(rule, 2))
+    assert revived.ranges == {('one', 'other'): 'other'}
+    assert revived(1, 1) == 'one'
+    assert revived(1, 5) == 'other'
+
+
 WELL_FORMED_TOKEN_TESTS = (
     ("", []),
     (

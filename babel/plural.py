@@ -175,6 +175,86 @@ class PluralRule:
         return self._func(n)
 
 
+class PluralRangeRule:
+    """Represents a set of language plural range rules, as defined by the
+    `CLDR pluralRanges data`_.
+
+    A plural range rule combines the cardinal plural categories of the two
+    endpoints of a numeric range into the single plural category that should
+    be used for the range as a whole:
+
+    >>> rule = PluralRangeRule(PluralRule({'one': 'n is 1'}), {('one', 'other'): 'other'})
+    >>> rule(1, 1)
+    'one'
+    >>> rule(1, 5)
+    'other'
+
+    The category of each endpoint is determined by evaluating the given
+    cardinal `PluralRule` for the endpoint value exactly as passed in.  In
+    particular, visible fraction digits of `decimal.Decimal` values are
+    significant: ``Decimal("1.0")`` may select a different category than
+    ``1``, so endpoints are never normalized or rounded first.
+
+    The combination of the two endpoint categories is then looked up in the
+    locale's range table.  If the table contains no explicit entry for the
+    combination -- including the case of a locale that has no range table at
+    all -- the plural category of the *end* value is used, as specified by
+    `UTS #35`_.
+
+    The endpoints are used as given; a *reversed* range (``start`` greater
+    than ``end``) is not reordered or rejected, and equal endpoints simply
+    look up the ``(category, category)`` combination.
+
+    .. _`CLDR pluralRanges data`: https://www.unicode.org/reports/tr35/tr35-numbers.html#plural-ranges
+    .. _`UTS #35`: https://www.unicode.org/reports/tr35/tr35-numbers.html#plural-ranges
+    """
+
+    __slots__ = ('cardinal_rule', 'ranges')
+
+    def __init__(
+        self,
+        cardinal_rule: Mapping[str, str] | Iterable[tuple[str, str]] | PluralRule,
+        ranges: Mapping[tuple[str, str], str] | None = None,
+    ) -> None:
+        """Initialize the range rule instance.
+
+        :param cardinal_rule: the locale's cardinal plural rules as a
+                              `PluralRule` object (or anything
+                              `PluralRule.parse` accepts), used to categorize
+                              each endpoint of the range.
+        :param ranges: a mapping of ``(start_category, end_category)`` tuples
+                       to the resulting plural category, as imported from the
+                       CLDR ``pluralRanges`` data.  Combinations not present
+                       fall back to the category of the end value.
+        """
+        self.cardinal_rule: PluralRule = PluralRule.parse(cardinal_rule)
+        self.ranges: Mapping[tuple[str, str], str] = dict(ranges or ())
+
+    def __repr__(self) -> str:
+        return f"<{type(self).__name__} {self.ranges!r}>"
+
+    def __getstate__(self) -> tuple[PluralRule, Mapping[tuple[str, str], str]]:
+        return self.cardinal_rule, self.ranges
+
+    def __setstate__(self, state: tuple[PluralRule, Mapping[tuple[str, str], str]]) -> None:
+        self.cardinal_rule, self.ranges = state
+
+    def __call__(
+        self,
+        start: float | decimal.Decimal,
+        end: float | decimal.Decimal,
+    ) -> str:
+        """Return the plural category for the range from ``start`` to ``end``.
+
+        :param start: the value at the start of the range
+        :param end: the value at the end of the range
+        :return: a plural tag such as ``'one'`` or ``'other'``
+        """
+        start_category = self.cardinal_rule(start)
+        end_category = self.cardinal_rule(end)
+        return self.ranges.get((start_category, end_category), end_category)
+
+
 def to_javascript(rule: Mapping[str, str] | Iterable[tuple[str, str]] | PluralRule) -> str:
     """Convert a list/dict of rules or a `PluralRule` object into a JavaScript
     function.  This function depends on no external library:

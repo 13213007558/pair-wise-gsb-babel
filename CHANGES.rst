@@ -1,6 +1,21 @@
 Babel Changelog
 ===============
 
+Unreleased
+----------
+
+Features
+~~~~~~~~
+
+* Core: Import the CLDR pluralRanges data and add `Locale.plural_range_form`
+  and `Locale.plural_ranges` to select the plural category of a numeric
+  range from its two endpoints
+* Numbers: Add `babel.numbers.format_plural_range`, a helper for
+  translation layers that picks a caller-provided text by the range's plural
+  category
+* Plural: Add `babel.plural.PluralRangeRule`, combining a locale's cardinal
+  plural rules with its CLDR plural range table
+
 Version 2.18.0
 --------------
 

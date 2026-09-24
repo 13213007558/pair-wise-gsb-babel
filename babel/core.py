@@ -16,7 +16,7 @@ from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, Literal
 
 from babel import localedata
-from babel.plural import PluralRule
+from babel.plural import PluralRangeRule, PluralRule
 
 __all__ = [
     'Locale',
@@ -1029,6 +1029,67 @@ class Locale:
         'many'
         """
         return self._data.get('plural_form', _default_plural_rule)
+
+    @property
+    def plural_ranges(self) -> Mapping[tuple[str, str], str]:
+        """The locale's plural range table, as imported from the CLDR
+        ``pluralRanges`` data.
+
+        The mapping keys are ``(start_category, end_category)`` tuples of
+        plural tags and the values are the resulting plural category for the
+        range.  Combinations not present in the table fall back to the
+        category of the end value; see `PluralRangeRule` for details.
+
+        >>> Locale('ka').plural_ranges[('one', 'other')]
+        'one'
+        >>> Locale('en').plural_ranges[('one', 'other')]
+        'other'
+
+        .. note:: The primary API to use this data is
+                  `Locale.plural_range_form`.
+
+        .. versionadded:: 2.19
+
+        :rtype: dict[tuple[str, str], str]
+        """
+        return self._data.get('plural_ranges', {})
+
+    @property
+    def plural_range_form(self) -> PluralRangeRule:
+        """Plural range rules for the locale.
+
+        The returned `PluralRangeRule` is callable with the two endpoints
+        of a numeric range and returns the plural category for the range as
+        a whole, using this locale's cardinal `Locale.plural_form` rules to
+        categorize each endpoint:
+
+        >>> Locale('en').plural_range_form(0, 1)
+        'other'
+        >>> Locale('ka').plural_range_form(1, 2)
+        'one'
+        >>> Locale('de').plural_range_form(2, 5)
+        'other'
+
+        Endpoint values are evaluated exactly as passed in; visible fraction
+        digits of `decimal.Decimal` values are significant and are not
+        stripped:
+
+        >>> import decimal
+        >>> Locale('de').plural_range_form(2, 1)
+        'one'
+        >>> Locale('de').plural_range_form(2, decimal.Decimal('1.0'))
+        'other'
+
+        Reversed ranges are evaluated as given (the endpoints are not
+        swapped), and equal endpoints look up the matching
+        ``(category, category)`` combination.  For locales without an
+        explicit CLDR range table, and for ``(start, end)`` category
+        combinations missing from the table, the category of the end value
+        is returned, as specified by UTS #35.
+
+        .. versionadded:: 2.19
+        """
+        return PluralRangeRule(self.plural_form, self.plural_ranges)
 
     @property
     def list_patterns(self) -> localedata.LocaleDataDict:

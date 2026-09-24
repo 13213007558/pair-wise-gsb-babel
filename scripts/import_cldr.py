@@ -116,6 +116,19 @@ def _extract_plural_rules(file_path):
     return rule_dict
 
 
+def _extract_plural_ranges(file_path):
+    range_dict = {}
+    prsup = parse(file_path)
+    for elem in prsup.findall('.//plurals/pluralRanges'):
+        ranges = {}
+        for rule in elem.findall('pluralRange'):
+            key = (rule.attrib['start'], rule.attrib['end'])
+            ranges[key] = rule.attrib['result']
+        for locale in elem.attrib['locales'].split():
+            range_dict[locale] = ranges
+    return range_dict
+
+
 def _time_to_seconds_past_midnight(time_expr):
     """
     Parse a time expression to seconds after midnight.
@@ -384,6 +397,7 @@ def _process_local_datas(sup, srcdir, destdir, force=True, dump_json=False):
     # prepare the per-locale plural rules definitions
     plural_rules = _extract_plural_rules(os.path.join(srcdir, 'supplemental', 'plurals.xml'))
     ordinal_rules = _extract_plural_rules(os.path.join(srcdir, 'supplemental', 'ordinals.xml'))
+    plural_ranges = _extract_plural_ranges(os.path.join(srcdir, 'supplemental', 'pluralRanges.xml'))
 
     filenames = os.listdir(os.path.join(srcdir, 'main'))
     filenames.remove('root.xml')
@@ -430,6 +444,8 @@ def _process_local_datas(sup, srcdir, destdir, force=True, dump_json=False):
             data['plural_form'] = plural_rules[locale_id]
         if locale_id in ordinal_rules:
             data['ordinal_form'] = ordinal_rules[locale_id]
+        if locale_id in plural_ranges:
+            data['plural_ranges'] = plural_ranges[locale_id]
         if locale_id in day_period_rules:
             data["day_period_rules"] = day_period_rules[locale_id]
 

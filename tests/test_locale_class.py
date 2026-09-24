@@ -1,3 +1,5 @@
+import decimal
+
 import pytest
 
 from babel import Locale
@@ -229,6 +231,37 @@ def test_plural_form_property():
     assert Locale('en').plural_form(0) == 'other'
     assert Locale('fr').plural_form(0) == 'one'
     assert Locale('ru').plural_form(100) == 'many'
+
+
+def test_plural_ranges_property():
+    assert Locale('en').plural_ranges[('one', 'other')] == 'other'
+    assert Locale('ka').plural_ranges[('one', 'other')] == 'one'
+    # Inherited from the parent locale
+    assert Locale('en', 'US').plural_ranges == Locale('en').plural_ranges
+    # Locales without explicit CLDR range data have an empty table
+    assert Locale('root').plural_ranges == {}
+
+
+def test_plural_range_form_property():
+    assert Locale('en').plural_range_form(0, 1) == 'other'
+    assert Locale('en').plural_range_form(1, 5) == 'other'
+    # The range table of these locales differs from just looking at the
+    # category of the end value
+    assert Locale('ka').plural_range_form(1, 2) == 'one'
+    assert Locale('ak').plural_range_form(1, 1) == 'other'
+    assert Locale('de').plural_range_form(2, 1) == 'one'
+    # Parent locale fallback
+    assert Locale('de', 'CH').plural_range_form(2, 1) == 'one'
+    # No explicit combination -> category of the end value
+    assert Locale('de').plural_range_form(1, 1) == 'one'
+    # No range table at all -> category of the end value
+    assert Locale('root').plural_range_form(1, 5) == 'other'
+
+
+def test_plural_range_form_decimal_visible_fraction_digits():
+    # Decimal('1.0') has a visible fraction digit, so it is not 'one' in German
+    assert Locale('de').plural_range_form(2, decimal.Decimal('1.0')) == 'other'
+    assert Locale('de').plural_range_form(2, 1) == 'one'
 
 
 def test_locale_provides_access_to_cldr_locale_data():

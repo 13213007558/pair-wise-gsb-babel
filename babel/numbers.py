@@ -25,6 +25,7 @@ import datetime
 import decimal
 import re
 import warnings
+from collections.abc import Mapping
 from typing import Any, Literal, cast, overload
 
 from babel.core import Locale, default_locale, get_global
@@ -696,6 +697,56 @@ def _get_compact_format(
             number = rounded
             break
     return number, format
+
+
+def format_plural_range(
+    start: float | decimal.Decimal,
+    end: float | decimal.Decimal,
+    texts: Mapping[str, str],
+    locale: Locale | str | None = None,
+) -> str:
+    """Select the translation text for a numeric range based on the locale's
+    plural range rules.
+
+    This is a helper for translation layers: the caller provides the
+    translated texts keyed by plural category, and the function picks the
+    one matching the range from ``start`` to ``end`` according to the
+    locale's cardinal plural rules and CLDR plural range table (see
+    `babel.plural.PluralRangeRule`):
+
+    >>> format_plural_range(1, 2, {'one': '{0}-{1} item', 'other': '{0}-{1} items'}, locale='en')
+    '{0}-{1} items'
+
+    The category of each endpoint is computed from the value exactly as
+    passed in; visible fraction digits of `decimal.Decimal` values are
+    significant and are not stripped.  Reversed ranges are evaluated as
+    given, and combinations missing from the locale's range table fall back
+    to the category of the end value.
+
+    >>> format_plural_range(1, 2, {'one': 'ein Element', 'other': 'Elemente'}, locale='de')
+    'Elemente'
+
+    .. versionadded:: 2.19
+
+    :param start: the value at the start of the range
+    :param end: the value at the end of the range
+    :param texts: a mapping of plural category (such as ``'one'`` or
+                  ``'other'``) to the translated text for that category
+    :param locale: the `Locale` object or locale identifier. Defaults to the
+                   system numeric locale.
+    :raise `UnknownLocaleError`: if the locale is not known
+    :raise KeyError: if ``texts`` has no entry for the required plural
+                     category
+    """
+    locale = Locale.parse(locale or LC_NUMERIC)
+    category = locale.plural_range_form(start, end)
+    try:
+        return texts[category]
+    except KeyError:
+        raise KeyError(
+            f"No text provided for plural category {category!r} "
+            f"(required for the range {start!r}-{end!r} in locale {locale!s})",
+        ) from None
 
 
 class UnknownCurrencyFormatError(KeyError):

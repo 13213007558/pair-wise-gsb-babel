@@ -15,7 +15,7 @@ from datetime import date
 
 import pytest
 
-from babel import localedata, numbers
+from babel import Locale, UnknownLocaleError, localedata, numbers
 from babel.numbers import (
     UnknownCurrencyError,
     get_currency_precision,
@@ -189,6 +189,29 @@ def test_decimal_precision():
     assert get_decimal_precision(decimal.Decimal('0.110')) == 2
     assert get_decimal_precision(decimal.Decimal('1.0')) == 0
     assert get_decimal_precision(decimal.Decimal('10000')) == 0
+
+
+def test_format_plural_range():
+    texts = {'one': 'one item', 'other': 'many items'}
+    assert numbers.format_plural_range(2, 5, texts, locale='en') == 'many items'
+    # Locales where the range table differs from just looking at the end value
+    assert numbers.format_plural_range(1, 2, texts, locale='ka') == 'one item'
+    assert numbers.format_plural_range(1, 1, texts, locale='ak') == 'many items'
+    assert numbers.format_plural_range(2, 1, texts, locale='de') == 'one item'
+    # Visible fraction digits of Decimals are significant
+    assert numbers.format_plural_range(2, decimal.Decimal('1.0'), texts, locale='de') == 'many items'
+    # Locale objects are accepted as well
+    assert numbers.format_plural_range(1, 2, texts, locale=Locale('ka')) == 'one item'
+
+
+def test_format_plural_range_missing_category():
+    with pytest.raises(KeyError, match="No text provided for plural category 'other'"):
+        numbers.format_plural_range(1, 2, {'one': 'one item'}, locale='en')
+
+
+def test_format_plural_range_unknown_locale():
+    with pytest.raises(UnknownLocaleError):
+        numbers.format_plural_range(1, 2, {'other': 'items'}, locale='xx_XX')
 
 
 def test_format_decimal():

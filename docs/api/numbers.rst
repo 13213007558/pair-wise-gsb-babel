@@ -15,6 +15,8 @@ Number Formatting
 
 .. autofunction:: format_compact_decimal
 
+.. autofunction:: format_plural_range
+
 .. autofunction:: format_currency
 
 .. autofunction:: format_compact_currency

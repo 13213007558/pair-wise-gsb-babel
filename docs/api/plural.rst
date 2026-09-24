@@ -13,6 +13,9 @@ Basic Interface
 .. autoclass:: PluralRule
    :members:
 
+.. autoclass:: PluralRangeRule
+   :members:
+
 Conversion Functionality
 ------------------------
 
