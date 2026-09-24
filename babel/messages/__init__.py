@@ -13,9 +13,19 @@ from babel.messages.catalog import (
     Message,
     TranslationError,
 )
+from babel.messages.icu import (
+    ICUMessage,
+    MessageFormatError,
+    compile_message,
+    format_message,
+)
 
 __all__ = [
     "Catalog",
+    "ICUMessage",
     "Message",
+    "MessageFormatError",
     "TranslationError",
+    "compile_message",
+    "format_message",
 ]
