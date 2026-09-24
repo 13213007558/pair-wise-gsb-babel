@@ -13,15 +13,24 @@ Number Formatting
 
 .. autofunction:: format_decimal
 
+.. autofunction:: format_decimal_parts
+
 .. autofunction:: format_compact_decimal
 
 .. autofunction:: format_currency
+
+.. autofunction:: format_currency_parts
 
 .. autofunction:: format_compact_currency
 
 .. autofunction:: format_percent
 
+.. autofunction:: format_percent_parts
+
 .. autofunction:: format_scientific
+
+.. autoclass:: NumberFormatPart
+    :members:
 
 Number Parsing
 --------------

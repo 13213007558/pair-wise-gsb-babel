@@ -19,6 +19,8 @@ Features
 * Messages: Merge in per-format keywords and auto_comments by @akx in :gh:`1243`
 * Messages: Update keywords for extraction of dpgettext and dnpgettext by @mardiros in :gh:`1235`
 * Messages: Validate all plurals in Python format checker by @tomasr8 in :gh:`1188`
+* Numbers: Add `format_decimal_parts`, `format_currency_parts` and `format_percent_parts`,
+  which return formatted numbers as ordered lists of typed (`NumberFormatPart`) segments
 * Time: Use standard library `timezone` instead of `FixedOffsetTimezone` by @akx in :gh:`1203`
 
 Bugfixes

@@ -248,6 +248,80 @@ def test_format_decimal_quantization():
             '0.9999999999', locale=locale_code, decimal_quantization=False).endswith('9999999999') is True
 
 
+def _join_parts(parts):
+    return ''.join(part.value for part in parts)
+
+
+def test_format_decimal_parts():
+    assert [(part.type, part.value) for part in numbers.format_decimal_parts(-12345.5, locale='en_US')] == [
+        ('sign', '-'),
+        ('integer', '12'),
+        ('group', ','),
+        ('integer', '345'),
+        ('decimal', '.'),
+        ('fraction', '5'),
+    ]
+    # Rounding grows the integer part; the parts still match the actual output.
+    assert [(part.type, part.value) for part in numbers.format_decimal_parts(999.99, '#,##0', locale='en_US')] == [
+        ('integer', '1'),
+        ('group', ','),
+        ('integer', '000'),
+    ]
+    # Quoted pattern text and compact-notation suffixes are literal parts.
+    assert [(part.type, part.value) for part in numbers.format_decimal_parts(5, "0 'o''clock'", locale='en_US')] == [
+        ('integer', '5'),
+        ('literal', " o'clock"),
+    ]
+    assert [(part.type, part.value) for part in numbers.format_decimal_parts(12345, '0K', locale='en_US')] == [
+        ('integer', '12345'),
+        ('literal', 'K'),
+    ]
+    # Parts unpack as plain (type, value) tuples.
+    for part_type, part_value in numbers.format_decimal_parts(1.5, locale='en_US'):
+        assert part_type in {'integer', 'decimal', 'fraction'}
+        assert isinstance(part_value, str)
+
+
+def test_format_decimal_parts_special_values():
+    assert [(part.type, part.value) for part in numbers.format_decimal_parts(-0.0, locale='en_US')] == [
+        ('sign', '-'),
+        ('integer', '0'),
+    ]
+    assert [(part.type, part.value) for part in numbers.format_decimal_parts(float('inf'), locale='en_US')] == [
+        ('literal', '\u221e'),
+    ]
+    assert [(part.type, part.value) for part in numbers.format_decimal_parts(float('-inf'), locale='en_US')] == [
+        ('sign', '-'),
+        ('literal', '\u221e'),
+    ]
+    assert [(part.type, part.value) for part in numbers.format_decimal_parts(float('nan'), locale='en_US')] == [
+        ('literal', 'NaN'),
+    ]
+
+
+def test_format_decimal_parts_scientific():
+    assert [(part.type, part.value) for part in numbers.format_decimal_parts(1234567, '##0.##E00', locale='en_US')] == [
+        ('integer', '1'),
+        ('decimal', '.'),
+        ('fraction', '23'),
+        ('exponent', 'E'),
+        ('exponent', '06'),
+    ]
+    assert [(part.type, part.value) for part in numbers.format_decimal_parts(0.0001, '#E0', locale='en_US')] == [
+        ('integer', '1'),
+        ('exponent', 'E'),
+        ('sign', '-'),
+        ('exponent', '4'),
+    ]
+
+
+def test_format_decimal_parts_all_locales():
+    for locale_code in localedata.locale_identifiers():
+        for number in (-12345.678, 0, 999.999):
+            parts = numbers.format_decimal_parts(number, locale=locale_code)
+            assert _join_parts(parts) == numbers.format_decimal(number, locale=locale_code)
+
+
 def test_format_currency():
     assert (numbers.format_currency(1099.98, 'USD', locale='en_US')
             == '$1,099.98')
@@ -420,6 +494,90 @@ def test_format_currency_long_display_name_custom_format():
             == '1100 US dollars')
 
 
+def test_format_currency_parts():
+    assert [(part.type, part.value) for part in numbers.format_currency_parts(1099.98, 'USD', locale='en_US')] == [
+        ('currency', '$'),
+        ('integer', '1'),
+        ('group', ','),
+        ('integer', '099'),
+        ('decimal', '.'),
+        ('fraction', '98'),
+    ]
+    # Multi-character symbols are a single currency part, not string matches.
+    assert [(part.type, part.value) for part in numbers.format_currency_parts(1099.98, 'EUR', locale='de_DE')] == [
+        ('integer', '1'),
+        ('group', '.'),
+        ('integer', '099'),
+        ('decimal', ','),
+        ('fraction', '98'),
+        ('literal', '\xa0'),
+        ('currency', '\u20ac'),
+    ]
+    # Accounting parentheses of negative amounts are sign parts.
+    assert [(part.type, part.value) for part in numbers.format_currency_parts(
+        -1099.98, 'USD', locale='en_US', format_type='accounting',
+    )] == [
+        ('sign', '('),
+        ('currency', '$'),
+        ('integer', '1'),
+        ('group', ','),
+        ('integer', '099'),
+        ('decimal', '.'),
+        ('fraction', '98'),
+        ('sign', ')'),
+    ]
+    # Locale-inserted direction marks are literal parts.
+    assert [(part.type, part.value) for part in numbers.format_currency_parts(
+        1099.98, 'EGP', locale='ar_EG', numbering_system='default',
+    )] == [
+        ('literal', '\u200f'),
+        ('integer', '1'),
+        ('group', '\u066c'),
+        ('integer', '099'),
+        ('decimal', '\u066b'),
+        ('fraction', '98'),
+        ('literal', '\xa0'),
+        ('currency', '\u062c.\u0645.\u200f'),
+    ]
+
+
+def test_format_currency_parts_long_display_name():
+    assert [(part.type, part.value) for part in numbers.format_currency_parts(
+        1099.98, 'USD', locale='en_US', format_type='name',
+    )] == [
+        ('integer', '1'),
+        ('group', ','),
+        ('integer', '099'),
+        ('decimal', '.'),
+        ('fraction', '98'),
+        ('literal', ' '),
+        ('currency', 'US dollars'),
+    ]
+    # The currency name may precede the number, depending on the locale.
+    assert [(part.type, part.value) for part in numbers.format_currency_parts(
+        1099.98, 'USD', locale='ee', format_type='name',
+    )] == [
+        ('currency', 'us ga dollar'),
+        ('literal', ' '),
+        ('integer', '1'),
+        ('group', ','),
+        ('integer', '099'),
+        ('decimal', '.'),
+        ('fraction', '98'),
+    ]
+
+
+def test_format_currency_parts_all_locales():
+    for locale_code in localedata.locale_identifiers():
+        for format_type in ('standard', 'accounting', 'name'):
+            try:
+                parts = numbers.format_currency_parts(-1099.98, 'USD', locale=locale_code, format_type=format_type)
+                expected = numbers.format_currency(-1099.98, 'USD', locale=locale_code, format_type=format_type)
+            except numbers.UnknownCurrencyFormatError:
+                continue
+            assert _join_parts(parts) == expected
+
+
 def test_format_percent():
     assert numbers.format_percent(0.34, locale='en_US') == '34%'
     assert numbers.format_percent(0.34, locale='en_US', numbering_system="default") == '34%'
@@ -469,6 +627,33 @@ def test_format_percent_quantization():
     for locale_code in localedata.locale_identifiers():
         assert numbers.format_percent(
             '0.9999999999', locale=locale_code, decimal_quantization=False).find('99999999') > -1
+
+
+def test_format_percent_parts():
+    assert [(part.type, part.value) for part in numbers.format_percent_parts(0.34, locale='en_US')] == [
+        ('integer', '34'),
+        ('percent', '%'),
+    ]
+    assert [(part.type, part.value) for part in numbers.format_percent_parts(25.1234, locale='sv_SE')] == [
+        ('integer', '2'),
+        ('group', '\xa0'),
+        ('integer', '512'),
+        ('literal', '\xa0'),
+        ('percent', '%'),
+    ]
+    # Per-mille signs are percent parts, too.
+    assert [(part.type, part.value) for part in numbers.format_percent_parts(25.1234, '#,##0\u2030', locale='en_US')] == [
+        ('integer', '25'),
+        ('group', ','),
+        ('integer', '123'),
+        ('percent', '\u2030'),
+    ]
+
+
+def test_format_percent_parts_all_locales():
+    for locale_code in localedata.locale_identifiers():
+        parts = numbers.format_percent_parts(-0.3456, locale=locale_code)
+        assert _join_parts(parts) == numbers.format_percent(-0.3456, locale=locale_code)
 
 
 def test_format_scientific():

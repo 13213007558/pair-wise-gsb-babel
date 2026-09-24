@@ -25,7 +25,7 @@ import datetime
 import decimal
 import re
 import warnings
-from typing import Any, Literal, cast, overload
+from typing import Any, Literal, NamedTuple, cast, overload
 
 from babel.core import Locale, default_locale, get_global
 from babel.localedata import LocaleDataDict
@@ -605,6 +605,54 @@ def format_decimal(
     )
 
 
+def format_decimal_parts(
+    number: float | decimal.Decimal | str,
+    format: str | NumberPattern | None = None,
+    locale: Locale | str | None = None,
+    decimal_quantization: bool = True,
+    group_separator: bool = True,
+    *,
+    numbering_system: Literal["default"] | str = "latn",
+) -> list[NumberFormatPart]:
+    """Return the given decimal number formatted as typed parts for a locale.
+
+    This is the parts-producing counterpart of :func:`format_decimal`: it
+    accepts the same arguments and applies the same rounding and pattern
+    rules, but returns an ordered list of :class:`NumberFormatPart`
+    instead of a string. Concatenating the ``value`` of all parts
+    yields the exact string :func:`format_decimal` would return.
+
+    >>> [(part.type, part.value) for part in format_decimal_parts(-12345.5, locale='en_US')]
+    [('sign', '-'), ('integer', '12'), ('group', ','), ('integer', '345'), ('decimal', '.'), ('fraction', '5')]
+    >>> [(part.type, part.value) for part in format_decimal_parts(12345.5, locale='de_DE')]
+    [('integer', '12'), ('group', '.'), ('integer', '345'), ('decimal', ','), ('fraction', '5')]
+
+    :param number: the number to format
+    :param format:
+    :param locale: the `Locale` object or locale identifier. Defaults to the system numeric locale.
+    :param decimal_quantization: Truncate and round high-precision numbers to
+                                 the format pattern. Defaults to `True`.
+    :param group_separator: Boolean to switch group separator on/off in a locale's
+                            number format.
+    :param numbering_system: The numbering system used for formatting number symbols. Defaults to "latn".
+                             The special value "default" will use the default numbering system of the locale.
+    :raise `UnsupportedNumberingSystemError`: If the numbering system is not supported by the locale.
+
+    .. versionadded:: 2.18.0
+    """
+    locale = Locale.parse(locale or LC_NUMERIC)
+    if format is None:
+        format = locale.decimal_formats[format]
+    pattern = parse_pattern(format)
+    return pattern.apply_parts(
+        number,
+        locale,
+        decimal_quantization=decimal_quantization,
+        group_separator=group_separator,
+        numbering_system=numbering_system,
+    )
+
+
 def format_compact_decimal(
     number: float | decimal.Decimal | str,
     *,
@@ -841,6 +889,83 @@ def format_currency(
     )
 
 
+def format_currency_parts(
+    number: float | decimal.Decimal | str,
+    currency: str,
+    format: str | NumberPattern | None = None,
+    locale: Locale | str | None = None,
+    currency_digits: bool = True,
+    format_type: Literal["name", "standard", "accounting"] = "standard",
+    decimal_quantization: bool = True,
+    group_separator: bool = True,
+    *,
+    numbering_system: Literal["default"] | str = "latn",
+) -> list[NumberFormatPart]:
+    """Return the given currency value formatted as typed parts for a locale.
+
+    This is the parts-producing counterpart of :func:`format_currency`: it
+    accepts the same arguments and applies the same rounding and pattern
+    rules, but returns an ordered list of :class:`NumberFormatPart`
+    instead of a string. Concatenating the ``value`` of all parts
+    yields the exact string :func:`format_currency` would return.
+
+    >>> [(part.type, part.value) for part in format_currency_parts(1099.98, 'USD', locale='en_US')]
+    [('currency', '$'), ('integer', '1'), ('group', ','), ('integer', '099'), ('decimal', '.'), ('fraction', '98')]
+    >>> [(part.type, part.value) for part in format_currency_parts(1099.98, 'USD', locale='en_US', format_type='name')]
+    [('integer', '1'), ('group', ','), ('integer', '099'), ('decimal', '.'), ('fraction', '98'), ('literal', ' '), ('currency', 'US dollars')]
+
+    :param number: the number to format
+    :param currency: the currency code
+    :param format: the format string to use
+    :param locale: the `Locale` object or locale identifier.
+                   Defaults to the system currency locale or numeric locale.
+    :param currency_digits: use the currency's natural number of decimal digits
+    :param format_type: the currency format type to use
+    :param decimal_quantization: Truncate and round high-precision numbers to
+                                 the format pattern. Defaults to `True`.
+    :param group_separator: Boolean to switch group separator on/off in a locale's
+                            number format.
+    :param numbering_system: The numbering system used for formatting number symbols. Defaults to "latn".
+                             The special value "default" will use the default numbering system of the locale.
+    :raise `UnsupportedNumberingSystemError`: If the numbering system is not supported by the locale.
+
+    .. versionadded:: 2.18.0
+    """
+    locale = Locale.parse(locale or LC_MONETARY)
+
+    if format_type == 'name':
+        return _format_currency_long_name_parts(
+            number,
+            currency,
+            locale=locale,
+            format=format,
+            currency_digits=currency_digits,
+            decimal_quantization=decimal_quantization,
+            group_separator=group_separator,
+            numbering_system=numbering_system,
+        )
+
+    if format:
+        pattern = parse_pattern(format)
+    else:
+        try:
+            pattern = locale.currency_formats[format_type]
+        except KeyError:
+            raise UnknownCurrencyFormatError(
+                f"{format_type!r} is not a known currency format type",
+            ) from None
+
+    return pattern.apply_parts(
+        number,
+        locale,
+        currency=currency,
+        currency_digits=currency_digits,
+        decimal_quantization=decimal_quantization,
+        group_separator=group_separator,
+        numbering_system=numbering_system,
+    )
+
+
 def _format_currency_long_name(
     number: float | decimal.Decimal | str,
     currency: str,
@@ -852,6 +977,32 @@ def _format_currency_long_name(
     group_separator: bool,
     numbering_system: Literal["default"] | str,
 ) -> str:
+    return ''.join(
+        part.value
+        for part in _format_currency_long_name_parts(
+            number,
+            currency,
+            locale=locale,
+            format=format,
+            currency_digits=currency_digits,
+            decimal_quantization=decimal_quantization,
+            group_separator=group_separator,
+            numbering_system=numbering_system,
+        )
+    )
+
+
+def _format_currency_long_name_parts(
+    number: float | decimal.Decimal | str,
+    currency: str,
+    *,
+    locale: Locale,
+    format: str | NumberPattern | None,
+    currency_digits: bool,
+    decimal_quantization: bool,
+    group_separator: bool,
+    numbering_system: Literal["default"] | str,
+) -> list[NumberFormatPart]:
     # Algorithm described here:
     # https://www.unicode.org/reports/tr35/tr35-numbers.html#Currencies
 
@@ -875,7 +1026,7 @@ def _format_currency_long_name(
 
     pattern = parse_pattern(format)
 
-    number_part = pattern.apply(
+    number_parts = pattern.apply_parts(
         number,
         locale,
         currency=currency,
@@ -885,7 +1036,19 @@ def _format_currency_long_name(
         numbering_system=numbering_system,
     )
 
-    return unit_pattern.format(number_part, display_name)
+    parts: list[NumberFormatPart] = []
+    pos = 0
+    for match in re.finditer(r'\{([01])\}', unit_pattern):
+        if match.start() > pos:
+            parts.append(NumberFormatPart('literal', unit_pattern[pos:match.start()]))
+        if match.group(1) == '0':
+            parts.extend(number_parts)
+        else:
+            parts.append(NumberFormatPart('currency', display_name))
+        pos = match.end()
+    if pos < len(unit_pattern):
+        parts.append(NumberFormatPart('literal', unit_pattern[pos:]))
+    return parts
 
 
 def format_compact_currency(
@@ -1005,6 +1168,54 @@ def format_percent(
         format = locale.percent_formats[None]
     pattern = parse_pattern(format)
     return pattern.apply(
+        number,
+        locale,
+        decimal_quantization=decimal_quantization,
+        group_separator=group_separator,
+        numbering_system=numbering_system,
+    )
+
+
+def format_percent_parts(
+    number: float | decimal.Decimal | str,
+    format: str | NumberPattern | None = None,
+    locale: Locale | str | None = None,
+    decimal_quantization: bool = True,
+    group_separator: bool = True,
+    *,
+    numbering_system: Literal["default"] | str = "latn",
+) -> list[NumberFormatPart]:
+    """Return the given percent value formatted as typed parts for a locale.
+
+    This is the parts-producing counterpart of :func:`format_percent`: it
+    accepts the same arguments and applies the same rounding and pattern
+    rules, but returns an ordered list of :class:`NumberFormatPart`
+    instead of a string. Concatenating the ``value`` of all parts
+    yields the exact string :func:`format_percent` would return.
+
+    >>> [(part.type, part.value) for part in format_percent_parts(0.34, locale='en_US')]
+    [('integer', '34'), ('percent', '%')]
+    >>> [(part.type, part.value) for part in format_percent_parts(25.1234, locale='sv_SE')]
+    [('integer', '2'), ('group', '\\xa0'), ('integer', '512'), ('literal', '\\xa0'), ('percent', '%')]
+
+    :param number: the percent number to format
+    :param format:
+    :param locale: the `Locale` object or locale identifier. Defaults to the system numeric locale.
+    :param decimal_quantization: Truncate and round high-precision numbers to
+                                 the format pattern. Defaults to `True`.
+    :param group_separator: Boolean to switch group separator on/off in a locale's
+                            number format.
+    :param numbering_system: The numbering system used for formatting number symbols. Defaults to "latn".
+                             The special value "default" will use the default numbering system of the locale.
+    :raise `UnsupportedNumberingSystemError`: If the numbering system is not supported by the locale.
+
+    .. versionadded:: 2.18.0
+    """
+    locale = Locale.parse(locale or LC_NUMERIC)
+    if not format:
+        format = locale.percent_formats[None]
+    pattern = parse_pattern(format)
+    return pattern.apply_parts(
         number,
         locale,
         decimal_quantization=decimal_quantization,
@@ -1294,6 +1505,26 @@ def parse_grouping(p: str) -> tuple[int, int]:
     return g1, g2
 
 
+class NumberFormatPart(NamedTuple):
+    """A typed segment of a formatted number string.
+
+    Instances of this class are returned by :func:`format_decimal_parts`,
+    :func:`format_currency_parts` and :func:`format_percent_parts`.
+    Concatenating the ``value`` of all parts, in order, yields the exact
+    string the corresponding string-formatting function would return.
+
+    .. versionadded:: 2.18.0
+    """
+
+    #: The type of the segment. One of ``integer``, ``fraction``, ``group``,
+    #: ``decimal``, ``sign``, ``currency``, ``percent``, ``exponent`` or
+    #: ``literal``.
+    type: str
+
+    #: The text of the segment, as it appears in the formatted output.
+    value: str
+
+
 def parse_pattern(pattern: NumberPattern | str) -> NumberPattern:
     """Parse number format patterns"""
     if isinstance(pattern, NumberPattern):
@@ -1476,6 +1707,71 @@ class NumberPattern:
         :rtype: str
         :raise UnsupportedNumberingSystemError: If the numbering system is not supported by the locale.
         """
+        return ''.join(
+            part.value
+            for part in self.apply_parts(
+                value,
+                locale,
+                currency=currency,
+                currency_digits=currency_digits,
+                decimal_quantization=decimal_quantization,
+                force_frac=force_frac,
+                group_separator=group_separator,
+                numbering_system=numbering_system,
+            )
+        )
+
+    def apply_parts(
+        self,
+        value: float | decimal.Decimal | str,
+        locale: Locale | str | None,
+        currency: str | None = None,
+        currency_digits: bool = True,
+        decimal_quantization: bool = True,
+        force_frac: tuple[int, int] | None = None,
+        group_separator: bool = True,
+        *,
+        numbering_system: Literal["default"] | str = "latn",
+    ) -> list[NumberFormatPart]:
+        """Render a number into an ordered list of typed parts.
+
+        The parts are produced with the same rounding and pattern rules as
+        :meth:`apply`; concatenating the ``value`` of all returned parts,
+        in order, yields the exact same string as :meth:`apply`.
+
+        Each part is a :class:`NumberFormatPart` whose ``type`` is one of:
+
+        * ``integer`` -- a run of integer digits
+        * ``fraction`` -- a run of fraction digits
+        * ``group`` -- a grouping separator
+        * ``decimal`` -- the decimal separator
+        * ``sign`` -- a plus or minus sign, or a parenthesis marking a
+          negative (accounting) subpattern
+        * ``currency`` -- a currency symbol, code or display name
+        * ``percent`` -- a percent or per-mille sign
+        * ``exponent`` -- the exponent symbol or exponent digits of
+          scientific notation
+        * ``literal`` -- any other static text from the pattern or locale
+
+        :param value: The value to format. If this is not a Decimal object,
+                      it will be cast to one.
+        :param locale: The locale to use for formatting.
+        :param currency: Which currency, if any, to format as.
+        :param currency_digits: Whether or not to use the currency's precision.
+                                If false, the pattern's precision is used.
+        :param decimal_quantization: Whether decimal numbers should be forcibly
+                                     quantized to produce a formatted output
+                                     strictly matching the CLDR definition for
+                                     the locale.
+        :param force_frac: DEPRECATED - a forced override for `self.frac_prec`
+                           for a single formatting invocation.
+        :param group_separator: Whether to use the locale's number group separator.
+        :param numbering_system: The numbering system used for formatting number symbols. Defaults to "latn".
+                                 The special value "default" will use the default numbering system of the locale.
+        :return: List of typed parts of the formatted number.
+        :rtype: list[NumberFormatPart]
+        :raise UnsupportedNumberingSystemError: If the numbering system is not supported by the locale.
+        """
         if not isinstance(value, decimal.Decimal):
             value = decimal.Decimal(str(value))
 
@@ -1486,6 +1782,8 @@ class NumberPattern:
         value = abs(value).normalize()
 
         # Prepare scientific notation metadata.
+        exp = 0
+        exp_sign = ''
         if self.exp_prec:
             value, exp, exp_sign = self.scientific_notation_elements(
                 value,
@@ -1517,51 +1815,114 @@ class NumberPattern:
         if not decimal_quantization or (self.exp_prec and frac_prec == (0, 0)):
             frac_prec = (frac_prec[0], max([frac_prec[1], get_decimal_precision(value)]))
 
+        number_parts: list[NumberFormatPart] = []
+
         # Render scientific notation.
         if self.exp_prec:
-            number = ''.join([
-                self._quantize_value(value, locale, frac_prec, group_separator, numbering_system=numbering_system),
-                get_exponential_symbol(locale, numbering_system=numbering_system),
-                exp_sign,  # type: ignore  # exp_sign is always defined here
-                self._format_int(str(exp), self.exp_prec[0], self.exp_prec[1], locale, numbering_system=numbering_system),  # type: ignore  # exp is always defined here
-            ])  # fmt: skip
+            number_parts.extend(
+                self._quantize_value_parts(value, locale, frac_prec, group_separator, numbering_system=numbering_system),
+            )
+            number_parts.append(NumberFormatPart('exponent', get_exponential_symbol(locale, numbering_system=numbering_system)))
+            if exp_sign:
+                number_parts.append(NumberFormatPart('sign', exp_sign))
+            number_parts.append(NumberFormatPart('exponent', self._format_int(str(exp), self.exp_prec[0], self.exp_prec[1], locale, numbering_system=numbering_system)))
 
         # Is it a significant digits pattern?
         elif '@' in self.pattern:
             text = self._format_significant(value, self.int_prec[0], self.int_prec[1])
             a, sep, b = text.partition(".")
-            number = self._format_int(a, 0, 1000, locale, numbering_system=numbering_system)
+            number_parts.extend(self._format_int_parts(a, 0, 1000, locale, numbering_system=numbering_system))
             if sep:
-                number += get_decimal_symbol(locale, numbering_system=numbering_system) + b
+                number_parts.append(NumberFormatPart('decimal', get_decimal_symbol(locale, numbering_system=numbering_system)))
+                number_parts.append(NumberFormatPart('fraction', b))
 
         # A normal number pattern.
         else:
-            number = self._quantize_value(
-                value,
-                locale,
-                frac_prec,
-                group_separator,
-                numbering_system=numbering_system,
+            number_parts.extend(
+                self._quantize_value_parts(
+                    value,
+                    locale,
+                    frac_prec,
+                    group_separator,
+                    numbering_system=numbering_system,
+                ),
             )
 
-        retval = ''.join(
-            (
-                self.prefix[is_negative],
-                number if self.number_pattern != '' else '',
-                self.suffix[is_negative],
-            ),
-        )
+        parts: list[NumberFormatPart] = []
+        parts.extend(self._affix_parts(self.prefix[is_negative], is_negative, currency, value, locale))
+        if self.number_pattern != '':
+            parts.extend(number_parts)
+        parts.extend(self._affix_parts(self.suffix[is_negative], is_negative, currency, value, locale))
+        return parts
 
-        if '¤' in retval and currency is not None:
-            retval = retval.replace('¤¤¤', get_currency_name(currency, value, locale))
-            retval = retval.replace('¤¤', currency.upper())
-            retval = retval.replace('¤', get_currency_symbol(currency, locale))
+    def _affix_parts(
+        self,
+        affix: str,
+        is_negative: int,
+        currency: str | None,
+        value: decimal.Decimal,
+        locale: Locale | str | None,
+    ) -> list[NumberFormatPart]:
+        """Split a pattern prefix or suffix into typed parts.
 
-        # remove single quotes around text, except for doubled single quotes
-        # which are replaced with a single quote
-        retval = re.sub(r"'([^']*)'", lambda m: m.group(1) or "'", retval)
+        Quoted sections of the pattern are emitted as literals, currency
+        placeholders as currency parts, percent and per-mille signs as
+        percent parts, and signs (including the parentheses of negative
+        accounting subpatterns) as sign parts. Everything else, such as
+        spaces, direction marks and compact-notation suffixes, is literal.
+        """
+        parts: list[NumberFormatPart] = []
+        literal: list[str] = []
 
-        return retval
+        def flush_literal() -> None:
+            if literal:
+                parts.append(NumberFormatPart('literal', ''.join(literal)))
+                literal.clear()
+
+        index = 0
+        in_quote = False
+        while index < len(affix):
+            char = affix[index]
+            if char == "'":
+                # A doubled single quote is a literal single quote; a lone
+                # one toggles quoting of literal text.
+                if index + 1 < len(affix) and affix[index + 1] == "'":
+                    literal.append("'")
+                    index += 2
+                    continue
+                in_quote = not in_quote
+                index += 1
+                continue
+            if in_quote:
+                literal.append(char)
+                index += 1
+                continue
+            if char == '¤' and currency is not None:
+                flush_literal()
+                run_length = 0
+                while index + run_length < len(affix) and affix[index + run_length] == '¤':
+                    run_length += 1
+                index += run_length
+                while run_length >= 3:
+                    parts.append(NumberFormatPart('currency', get_currency_name(currency, value, locale)))
+                    run_length -= 3
+                if run_length >= 2:
+                    parts.append(NumberFormatPart('currency', currency.upper()))
+                    run_length -= 2
+                if run_length:
+                    parts.append(NumberFormatPart('currency', get_currency_symbol(currency, locale)))
+                continue
+            if char in '%‰':
+                flush_literal()
+                parts.append(NumberFormatPart('percent', char))
+            elif char in '-+' or (is_negative and char in '()'):
+                flush_literal()
+                parts.append(NumberFormatPart('sign', char))
+            else:
+                literal.append(char)
+            index += 1
+        flush_literal()
+        return parts
 
     #
     # This is one tricky piece of code.  The idea is to rely as much as possible
@@ -1611,17 +1972,40 @@ class NumberPattern:
         *,
         numbering_system: Literal["default"] | str,
     ) -> str:
+        return ''.join(
+            part.value
+            for part in self._format_int_parts(
+                value,
+                min,
+                max,
+                locale,
+                numbering_system=numbering_system,
+            )
+        )
+
+    def _format_int_parts(
+        self,
+        value: str,
+        min: int,
+        max: int,
+        locale: Locale | str | None,
+        *,
+        numbering_system: Literal["default"] | str,
+    ) -> list[NumberFormatPart]:
         width = len(value)
         if width < min:
             value = '0' * (min - width) + value
         gsize = self.grouping[0]
-        ret = ''
+        parts: list[NumberFormatPart] = []
         symbol = get_group_symbol(locale, numbering_system=numbering_system)
         while len(value) > gsize:
-            ret = symbol + value[-gsize:] + ret
+            parts.append(NumberFormatPart('integer', value[-gsize:]))
+            parts.append(NumberFormatPart('group', symbol))
             value = value[:-gsize]
             gsize = self.grouping[1]
-        return value + ret
+        parts.append(NumberFormatPart('integer', value))
+        parts.reverse()
+        return parts
 
     def _quantize_value(
         self,
@@ -1632,28 +2016,53 @@ class NumberPattern:
         *,
         numbering_system: Literal["default"] | str,
     ) -> str:
+        return ''.join(
+            part.value
+            for part in self._quantize_value_parts(
+                value,
+                locale,
+                frac_prec,
+                group_separator,
+                numbering_system=numbering_system,
+            )
+        )
+
+    def _quantize_value_parts(
+        self,
+        value: decimal.Decimal,
+        locale: Locale | str | None,
+        frac_prec: tuple[int, int],
+        group_separator: bool,
+        *,
+        numbering_system: Literal["default"] | str,
+    ) -> list[NumberFormatPart]:
         # If the number is +/-Infinity, we can't quantize it
         if value.is_infinite():
-            return get_infinity_symbol(locale, numbering_system=numbering_system)
+            return [NumberFormatPart('literal', get_infinity_symbol(locale, numbering_system=numbering_system))]
+        # NaN has no meaningful digits either; render it as a literal.
+        if value.is_nan():
+            return [NumberFormatPart('literal', f"{value:f}")]
         quantum = get_decimal_quantum(frac_prec[1])
         rounded = value.quantize(quantum)
         a, sep, b = f"{rounded:f}".partition(".")
-        integer_part = a
+        parts: list[NumberFormatPart] = []
         if group_separator:
-            integer_part = self._format_int(
+            parts.extend(self._format_int_parts(
                 a,
                 self.int_prec[0],
                 self.int_prec[1],
                 locale,
                 numbering_system=numbering_system,
-            )
-        number = integer_part + self._format_frac(
+            ))
+        else:
+            parts.append(NumberFormatPart('integer', a))
+        parts.extend(self._format_frac_parts(
             b or '0',
             locale=locale,
             force_frac=frac_prec,
             numbering_system=numbering_system,
-        )
-        return number
+        ))
+        return parts
 
     def _format_frac(
         self,
@@ -1663,11 +2072,32 @@ class NumberPattern:
         *,
         numbering_system: Literal["default"] | str,
     ) -> str:
+        return ''.join(
+            part.value
+            for part in self._format_frac_parts(
+                value,
+                locale,
+                force_frac=force_frac,
+                numbering_system=numbering_system,
+            )
+        )
+
+    def _format_frac_parts(
+        self,
+        value: str,
+        locale: Locale | str | None,
+        force_frac: tuple[int, int] | None = None,
+        *,
+        numbering_system: Literal["default"] | str,
+    ) -> list[NumberFormatPart]:
         min, max = force_frac or self.frac_prec
         if len(value) < min:
             value += '0' * (min - len(value))
         if max == 0 or (min == 0 and int(value) == 0):
-            return ''
+            return []
         while len(value) > min and value[-1] == '0':
             value = value[:-1]
-        return get_decimal_symbol(locale, numbering_system=numbering_system) + value
+        return [
+            NumberFormatPart('decimal', get_decimal_symbol(locale, numbering_system=numbering_system)),
+            NumberFormatPart('fraction', value),
+        ]
