@@ -13,13 +13,13 @@ from __future__ import annotations
 import datetime
 import re
 from collections import defaultdict
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from copy import copy
 from difflib import SequenceMatcher
 from email import message_from_string
 from heapq import nlargest
 from string import Formatter
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, NamedTuple, TypedDict
 
 from babel import __version__ as VERSION
 from babel.core import Locale, UnknownLocaleError
@@ -36,8 +36,11 @@ __all__ = [
     'DEFAULT_HEADER',
     'PYTHON_FORMAT',
     'Catalog',
+    'GlobalMatchReport',
+    'MatchedMessage',
     'Message',
     'TranslationError',
+    'UnmatchedMessage',
 ]
 
 
@@ -359,6 +362,142 @@ class ConflictInfo(TypedDict):
     filename: str
     project: str
     version: str
+
+
+class MatchedMessage(NamedTuple):
+    """A single one-to-one match applied by :meth:`Catalog.update`
+    when running in ``"global"`` match mode.
+    """
+
+    key: tuple[str, str] | str
+    """The key of the template (new) message."""
+
+    previous_key: tuple[str, str] | str
+    """The key of the old catalog message the translation was taken from."""
+
+    score: float
+    """The score the scoring function assigned to this pair."""
+
+
+class UnmatchedMessage(NamedTuple):
+    """A message that was left unmatched by :meth:`Catalog.update`
+    when running in ``"global"`` match mode, along with the reason why.
+    """
+
+    origin: str
+    """``"template"`` for new messages left untranslated, ``"catalog"`` for
+    old messages whose translation was not reused."""
+
+    key: tuple[str, str] | str
+    """The key of the unmatched message."""
+
+    reason: str
+    """A human-readable explanation of why the message was not matched."""
+
+
+class GlobalMatchReport(NamedTuple):
+    """The outcome of :meth:`Catalog.update` in ``"global"`` match mode."""
+
+    matched: list[MatchedMessage]
+    """The one-to-one matches that were applied, in template order."""
+
+    unmatched: list[UnmatchedMessage]
+    """The messages that were not matched, with an explanation for each."""
+
+
+def _placeholder_names(message: Message) -> frozenset[str]:
+    """Extract the set of placeholder names used by a message's msgid(s).
+
+    Handles Python %-format (``%(name)s``) and brace-format (``{name}``)
+    placeholders. Anonymous %-format specifiers are represented by their
+    conversion character (e.g. ``"%s"``), anonymous brace fields by the
+    empty string.
+    """
+    ids = message.id
+    if not isinstance(ids, (list, tuple)):
+        ids = (ids,)
+    names: set[str] = set()
+    for id_ in ids:
+        for match in PYTHON_FORMAT.finditer(id_):
+            name, _, conversion = match.groups()
+            if conversion == '%':  # a literal "%%"
+                continue
+            names.add(name if name is not None else f'%{conversion}')
+        if '{' in id_:
+            try:
+                fields = Formatter().parse(id_)
+                for _, field_name, _, _ in fields:
+                    if field_name is not None:
+                        names.add(field_name)
+            except ValueError:
+                pass
+    return frozenset(names)
+
+
+def _default_fuzzy_score(old_message: Message, new_message: Message) -> float:
+    """The default scoring function for global fuzzy matching.
+
+    Computes the :class:`difflib.SequenceMatcher` ratio between the
+    normalized (lower-cased, stripped) singular msgids of both messages.
+    """
+    def normalize(message: Message) -> str:
+        id_ = message.id
+        if isinstance(id_, (list, tuple)):
+            id_ = id_[0]
+        return id_.lower().strip()
+
+    matcher = SequenceMatcher(autojunk=False)
+    matcher.set_seq1(normalize(old_message))
+    matcher.set_seq2(normalize(new_message))
+    return matcher.ratio()
+
+
+def _max_weight_assignment(weights: list[list[int]]) -> dict[int, int]:
+    """Solve a rectangular assignment problem for maximum total weight.
+
+    ``weights`` is a matrix of integer weights with at least as many columns
+    as rows. Returns a mapping of row index to column index describing an
+    optimal assignment, computed with the Kuhn-Munkres (Hungarian) algorithm
+    in O(n^2 * m) time.
+    """
+    n = len(weights)
+    m = len(weights[0])
+    u = [0] * (n + 1)
+    v = [0] * (m + 1)
+    p = [0] * (m + 1)
+    way = [0] * (m + 1)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv: list[int | None] = [None] * (m + 1)
+        used = [False] * (m + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = None
+            j1 = 0
+            for j in range(1, m + 1):
+                if not used[j]:
+                    cur = -weights[i0 - 1][j - 1] - u[i0] - v[j]
+                    if minv[j] is None or cur < minv[j]:
+                        minv[j] = cur
+                        way[j] = j0
+                    if delta is None or minv[j] < delta:
+                        delta = minv[j]
+                        j1 = j
+            for j in range(m + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while j0:
+            p[j0] = p[way[j0]]
+            j0 = way[j0]
+    return {p[j] - 1: j - 1 for j in range(1, m + 1) if p[j]}
 
 
 class Catalog:
@@ -906,7 +1045,12 @@ class Catalog:
         update_header_comment: bool = False,
         keep_user_comments: bool = True,
         update_creation_date: bool = True,
-    ) -> None:
+        *,
+        match_mode: str = "greedy",
+        min_score: float = 0.6,
+        score_func: Callable[[Message, Message], float] | None = None,
+        allow_cross_context: bool = False,
+    ) -> GlobalMatchReport | None:
         """Update the catalog based on the given template catalog.
 
         >>> from babel.messages import Catalog
@@ -956,19 +1100,73 @@ class Catalog:
         >>> list(catalog.obsolete.values())
         [<Message 'head' (flags: [])>]
 
+        With ``match_mode="global"``, fuzzy matching performs a global
+        one-to-one assignment between all remaining old translations and new
+        messages, so a single old translation is never handed out to several
+        new messages:
+
+        >>> template = Catalog()
+        >>> template.add('Save file!', locations=[('main.py', 10)])
+        <Message ...>
+        >>> template.add('save file', locations=[('main.py', 11)])
+        <Message ...>
+        >>> catalog = Catalog(locale='de_DE')
+        >>> catalog.add('Save file', 'Datei speichern', locations=[('main.py', 1)])
+        <Message ...>
+        >>> catalog.add('Save files', 'Dateien speichern', locations=[('main.py', 2)])
+        <Message ...>
+        >>> report = catalog.update(template, match_mode='global')
+        >>> catalog['Save file!'].string
+        'Dateien speichern'
+        >>> catalog['save file'].string
+        'Datei speichern'
+        >>> for match in report.matched:
+        ...     print(match.key, '<-', match.previous_key, round(match.score, 3))
+        Save file! <- Save files 0.9
+        save file <- Save file 1.0
+
+        .. note:: In ``global`` mode, exact matches (same msgid and context)
+           are settled first; only the remaining messages take part in fuzzy
+           matching. Candidates must have compatible plural forms and use the
+           same placeholders, and (unless ``allow_cross_context`` is enabled)
+           share the same context. Ties in the total score are broken by a
+           stable rule preferring earlier template messages and earlier
+           old-catalog messages.
+
         :param template: the reference catalog, usually read from a POT file
         :param no_fuzzy_matching: whether to use fuzzy matching of message IDs
         :param update_header_comment: whether to copy the header comment from the template
         :param keep_user_comments: whether to keep user comments from the old catalog
         :param update_creation_date: whether to copy the creation date from the template
+        :param match_mode: ``greedy`` (the default) matches each template message
+                          independently against the closest old message, possibly reusing
+                          the same old translation several times; ``global`` performs
+                          a one-to-one assignment between all remaining old translations
+                          and new messages that maximizes the total score.
+        :param min_score: the minimum score a candidate pair needs in ``global``
+                          mode to be eligible for matching; template messages without
+                          a candidate reaching the threshold stay untranslated.
+        :param score_func: an optional callable ``(old_message, new_message) -> float``
+                           used to score candidate pairs in ``global`` mode; defaults
+                           to a normalized :class:`difflib.SequenceMatcher` ratio of the
+                           singular msgids.
+        :param allow_cross_context: whether ``global`` mode may match messages whose
+                                    contexts differ; by default candidates must share the
+                                    same context.
+        :return: in ``global`` match mode, a :class:`GlobalMatchReport` describing
+                 the applied matches and explaining every unmatched message;
+                 ``None`` otherwise.
         """
+        if match_mode not in ('greedy', 'global'):
+            raise ValueError(f"match_mode must be 'greedy' or 'global', got {match_mode!r}")
+
         messages = self._messages
         remaining = messages.copy()
         self._messages = {}
 
         # Prepare for fuzzy matching
         fuzzy_candidates = {}
-        if not no_fuzzy_matching:
+        if not no_fuzzy_matching and match_mode == 'greedy':
             for msgid in messages:
                 if msgid and messages[msgid].string:
                     key = self._key_for(msgid)
@@ -1017,28 +1215,175 @@ class Catalog:
                 message.flags |= {'fuzzy'}
             self[message.id] = message
 
-        for message in template:
-            if message.id:
+        def _match_global() -> GlobalMatchReport:
+            score = score_func or _default_fuzzy_score
+
+            # Exact matches are settled first; only the remaining template
+            # messages and old translations take part in the global fuzzy
+            # assignment.
+            pending = []
+            for message in template:
+                if not message.id:
+                    continue
                 key = self._key_for(message.id, message.context)
                 if key in messages:
                     _merge(message, key, key)
                 else:
-                    if not no_fuzzy_matching:
-                        # do some fuzzy matching with difflib
-                        matches = get_close_matches(
-                            self._to_fuzzy_match_key(key),
-                            fuzzy_candidates.keys(),
-                            1,
-                        )
-                        if matches:
-                            modified_key = matches[0]
-                            newkey, newctxt = fuzzy_candidates[modified_key]
-                            if newctxt is not None:
-                                newkey = newkey, newctxt
-                            _merge(message, newkey, key)
-                            continue
+                    pending.append((message, key))
 
-                    self[message.id] = message
+            old_keys = [key for key in remaining if remaining[key].string]
+            old_placeholders = {
+                key: _placeholder_names(remaining[key]) for key in old_keys
+            }
+
+            # Score every compatible candidate pair. Candidates must agree on
+            # plural form and placeholders, and (by default) on context.
+            edges = {}
+            has_candidate = [False] * len(pending)
+            best_score = [0.0] * len(pending)
+            for new_idx, (message, _key) in enumerate(pending):
+                new_placeholders = _placeholder_names(message)
+                for old_idx, old_key in enumerate(old_keys):
+                    old_message = remaining[old_key]
+                    if (
+                        not allow_cross_context
+                        and old_message.context != message.context
+                    ):
+                        continue
+                    if old_message.pluralizable != message.pluralizable:
+                        continue
+                    if old_placeholders[old_key] != new_placeholders:
+                        continue
+                    has_candidate[new_idx] = True
+                    pair_score = score(old_message, message)
+                    best_score[new_idx] = max(best_score[new_idx], pair_score)
+                    if pair_score >= min_score:
+                        edges[new_idx, old_idx] = pair_score
+
+            # Decompose the candidate graph into connected components so that
+            # each assignment problem stays small.
+            parent = {}
+
+            def find(node):
+                while parent[node] != node:
+                    parent[node] = parent[parent[node]]
+                    node = parent[node]
+                return node
+
+            for new_idx, old_idx in edges:
+                new_node = ('new', new_idx)
+                old_node = ('old', old_idx)
+                parent.setdefault(new_node, new_node)
+                parent.setdefault(old_node, old_node)
+                new_root, old_root = find(new_node), find(old_node)
+                if new_root != old_root:
+                    parent[new_root] = old_root
+
+            components = defaultdict(lambda: {'new': [], 'old': []})
+            for node in parent:
+                components[find(node)][node[0]].append(node[1])
+
+            # Solve one assignment problem per component. Eligible pairs get
+            # a weight dominated by their score; a smaller positional bonus
+            # resolves ties stably towards earlier template messages and
+            # earlier old-catalog messages. Dummy zero-weight columns let
+            # messages stay unmatched instead of forcing a bad match.
+            scale = 1_000_000
+            min_score_int = round(min_score * scale)
+            assignment = {}
+            for component in components.values():
+                rows = sorted(component['new'])
+                columns = sorted(component['old'])
+                num_rows = len(rows)
+                num_columns = len(columns) + num_rows
+                max_bonus = (num_rows + 1) * (num_columns + 1)
+                score_weight = num_rows * max_bonus + 1
+                weights = [[0] * num_columns for _ in range(num_rows)]
+                for row, new_idx in enumerate(rows):
+                    for column, old_idx in enumerate(columns):
+                        pair_score = edges.get((new_idx, old_idx))
+                        if pair_score is None:
+                            continue
+                        score_int = max(0, round(pair_score * scale) - min_score_int)
+                        bonus = (num_rows - row) * num_columns + (num_columns - column)
+                        weights[row][column] = score_int * score_weight + bonus
+                for row, column in _max_weight_assignment(weights).items():
+                    if column < len(columns) and weights[row][column] > 0:
+                        assignment[rows[row]] = columns[column]
+
+            matched = []
+            unmatched = []
+            used_old_keys = set()
+            for new_idx, (message, key) in enumerate(pending):
+                if new_idx in assignment:
+                    old_idx = assignment[new_idx]
+                    old_key = old_keys[old_idx]
+                    _merge(message, old_key, key)
+                    used_old_keys.add(old_key)
+                    matched.append(MatchedMessage(
+                        key=key,
+                        previous_key=old_key,
+                        score=edges[new_idx, old_idx],
+                    ))
+                    continue
+                self[message.id] = message
+                if not has_candidate[new_idx]:
+                    reason = (
+                        'no compatible candidate (plural form, placeholders, '
+                        'or context differ)'
+                    )
+                elif best_score[new_idx] < min_score:
+                    reason = (
+                        f'best candidate score {best_score[new_idx]:.3f} is '
+                        f'below min_score {min_score}'
+                    )
+                else:
+                    reason = (
+                        'candidate translation claimed by a higher-scoring '
+                        'template message'
+                    )
+                unmatched.append(UnmatchedMessage(
+                    origin='template', key=key, reason=reason,
+                ))
+
+            for old_key in old_keys:
+                if old_key not in used_old_keys:
+                    unmatched.append(UnmatchedMessage(
+                        origin='catalog',
+                        key=old_key,
+                        reason=(
+                            'translation not reused by any template message; '
+                            'message is now obsolete'
+                        ),
+                    ))
+            return GlobalMatchReport(matched=matched, unmatched=unmatched)
+
+        report = None
+        if match_mode == 'global' and not no_fuzzy_matching:
+            report = _match_global()
+        else:
+            for message in template:
+                if message.id:
+                    key = self._key_for(message.id, message.context)
+                    if key in messages:
+                        _merge(message, key, key)
+                    else:
+                        if not no_fuzzy_matching:
+                            # do some fuzzy matching with difflib
+                            matches = get_close_matches(
+                                self._to_fuzzy_match_key(key),
+                                fuzzy_candidates.keys(),
+                                1,
+                            )
+                            if matches:
+                                modified_key = matches[0]
+                                newkey, newctxt = fuzzy_candidates[modified_key]
+                                if newctxt is not None:
+                                    newkey = newkey, newctxt
+                                _merge(message, newkey, key)
+                                continue
+
+                        self[message.id] = message
 
         for msgid in remaining:
             if no_fuzzy_matching or msgid not in fuzzy_matches:
@@ -1053,6 +1398,8 @@ class Catalog:
         # used to update the catalog
         if update_creation_date:
             self.creation_date = template.creation_date
+
+        return report
 
     def _to_fuzzy_match_key(self, key: tuple[str, str] | str) -> str:
         """Converts a message key to a string suitable for fuzzy matching."""

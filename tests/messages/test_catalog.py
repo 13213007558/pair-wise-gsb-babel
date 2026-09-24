@@ -13,7 +13,7 @@
 import copy
 import datetime
 import pickle
-from io import StringIO
+from io import BytesIO, StringIO
 
 from babel.dates import UTC, format_datetime
 from babel.messages import catalog, pofile
@@ -601,3 +601,197 @@ msgid ""
 msgstr ""
 "POT-Creation-Date: 2007-04-01 15:30+0200\n"
     """))))
+
+def test_update_greedy_match_mode_reuses_translations():
+    # The default greedy mode may hand the same old translation to several
+    # new messages.
+    template = catalog.Catalog()
+    template.add('Save file!')
+    template.add('save file')
+    cat = catalog.Catalog(locale='de_DE')
+    cat.add('Save file', 'Datei speichern')
+    cat.add('Save files', 'Dateien speichern')
+    assert cat.update(template) is None
+    assert cat['Save file!'].string == 'Datei speichern'
+    assert cat['save file'].string == 'Datei speichern'
+
+
+def test_update_global_match_mode_one_to_one():
+    # In global mode each old translation is assigned to at most one new
+    # message, maximizing the total score.
+    template = catalog.Catalog()
+    template.add('Save file!')
+    template.add('save file')
+    cat = catalog.Catalog(locale='de_DE')
+    cat.add('Save file', 'Datei speichern')
+    cat.add('Save files', 'Dateien speichern')
+    report = cat.update(template, match_mode='global')
+    assert cat['Save file!'].string == 'Dateien speichern'
+    assert cat['save file'].string == 'Datei speichern'
+    assert [(m.key, m.previous_key) for m in report.matched] == [
+        ('Save file!', 'Save files'),
+        ('save file', 'Save file'),
+    ]
+    assert report.unmatched == []
+
+
+def test_update_global_match_mode_greedy_steals_unique_candidate():
+    # A local greedy pass gives 'alpha' to 'alpha2' (its best match) and
+    # leaves nothing for 'alpha3'; the global assignment trades 'alpha2's
+    # best match for a better total score.
+    template = catalog.Catalog()
+    template.add('alpha2')
+    template.add('alpha3')
+    cat = catalog.Catalog(locale='de_DE')
+    cat.add('alpha', 'ALPHA')
+    cat.add('beta', 'BETA')
+
+    scores = {
+        ('alpha', 'alpha2'): 0.9,
+        ('alpha', 'alpha3'): 0.95,
+        ('beta', 'alpha2'): 0.8,
+        ('beta', 'alpha3'): 0.1,
+    }
+
+    def score(old_message, new_message):
+        return scores.get((old_message.id, new_message.id), 0.0)
+
+    report = cat.update(template, match_mode='global', score_func=score, min_score=0.5)
+    assert cat['alpha2'].string == 'BETA'
+    assert cat['alpha3'].string == 'ALPHA'
+    assert cat['alpha2'].fuzzy
+    assert cat['alpha3'].fuzzy
+    assert cat['alpha2'].previous_id == ['beta']
+    assert cat['alpha3'].previous_id == ['alpha']
+    assert [(m.key, m.previous_key, m.score) for m in report.matched] == [
+        ('alpha2', 'beta', 0.8),
+        ('alpha3', 'alpha', 0.95),
+    ]
+    assert report.unmatched == []
+
+
+def test_update_global_match_mode_min_score_not_reached():
+    template = catalog.Catalog()
+    template.add('Completely different text')
+    cat = catalog.Catalog(locale='de_DE')
+    cat.add('Save file', 'Datei speichern')
+    report = cat.update(template, match_mode='global', min_score=0.9)
+    # Nothing reaches the threshold: the new message stays untranslated and
+    # the old translation is not force-assigned.
+    assert not cat['Completely different text'].string
+    assert not cat['Completely different text'].fuzzy
+    assert report.matched == []
+    assert [(u.origin, u.key) for u in report.unmatched] == [
+        ('template', 'Completely different text'),
+        ('catalog', 'Save file'),
+    ]
+    assert 'below min_score' in report.unmatched[0].reason
+    assert 'obsolete' in report.unmatched[1].reason
+    assert 'Save file' in cat.obsolete
+
+
+def test_update_global_match_mode_candidate_compatibility():
+    template = catalog.Catalog()
+    template.add(('apple', 'apples'))
+    template.add('Hello %(name)s!')
+    template.add('Hello %(user)s!')
+    cat = catalog.Catalog(locale='de_DE')
+    cat.add('apples', 'Äpfel')  # singular old vs plural new: incompatible
+    cat.add('Hello %(user)s', 'Hallo %(user)s')
+    report = cat.update(template, match_mode='global', min_score=0.5)
+    # plural forms differ -> no candidate
+    assert cat['apple'].string == ('', '')
+    # placeholders differ -> no candidate
+    assert not cat['Hello %(name)s!'].string
+    # placeholders match -> fuzzy match
+    assert cat['Hello %(user)s!'].string == 'Hallo %(user)s'
+    assert cat['Hello %(user)s!'].fuzzy
+    reasons = {u.key: u.reason for u in report.unmatched if u.origin == 'template'}
+    assert 'no compatible candidate' in reasons['apple']
+    assert 'no compatible candidate' in reasons['Hello %(name)s!']
+
+
+def test_update_global_match_mode_context_not_crossed_by_default():
+    template = catalog.Catalog()
+    template.add('Open!', context='menu')
+    cat = catalog.Catalog(locale='de_DE')
+    cat.add('Open', 'Öffnen', context='button')
+    report = cat.update(template, match_mode='global', min_score=0.5)
+    message = cat.get('Open!', context='menu')
+    assert not message.string
+    assert report.unmatched[0].origin == 'template'
+    assert 'no compatible candidate' in report.unmatched[0].reason
+
+    cat = catalog.Catalog(locale='de_DE')
+    cat.add('Open', 'Öffnen', context='button')
+    cat.update(template, match_mode='global', min_score=0.5, allow_cross_context=True)
+    message = cat.get('Open!', context='menu')
+    assert message.string == 'Öffnen'
+    assert message.fuzzy
+    assert message.previous_id == ['Open']
+
+
+def test_update_global_match_mode_stable_tie_break():
+    # Equal scores are resolved stably towards earlier old-catalog messages.
+    template = catalog.Catalog()
+    template.add('hello!')
+    cat = catalog.Catalog(locale='de_DE')
+    cat.add('hello', 'eins')
+    cat.add('Hello', 'zwei')
+    report = cat.update(template, match_mode='global')
+    assert cat['hello!'].string == 'eins'
+    assert report.matched[0].previous_key == 'hello'
+    assert 'Hello' in cat.obsolete
+
+
+def test_update_global_match_mode_po_roundtrip():
+    cat = pofile.read_po(StringIO('''
+# Keep me (files)
+#: old.py:2
+msgid "Save files"
+msgstr "Dateien speichern"
+
+# Keep me (file)
+#: old.py:1
+msgid "Save file"
+msgstr "Datei speichern"
+'''))
+    template = pofile.read_po(StringIO('''
+#: main.py:10
+msgid "Save file!"
+msgstr ""
+
+#: main.py:11
+msgid "save file"
+msgstr ""
+'''))
+    cat.update(template, match_mode='global')
+    assert cat['Save file!'].previous_id == ['Save files']
+    assert cat['save file'].previous_id == ['Save file']
+
+    buf = BytesIO()
+    pofile.write_po(buf, cat, include_previous=True)
+    buf.seek(0)
+    reread = pofile.read_po(buf)
+
+    changed = reread.get('Save file!')
+    assert changed.string == 'Dateien speichern'
+    assert changed.fuzzy
+    assert 'Keep me (files)' in changed.user_comments
+    assert changed.locations == [('main.py', 10)]
+
+    renamed = reread.get('save file')
+    assert renamed.string == 'Datei speichern'
+    assert renamed.fuzzy
+    assert 'Keep me (file)' in renamed.user_comments
+    assert renamed.locations == [('main.py', 11)]
+
+
+def test_update_invalid_match_mode():
+    cat = catalog.Catalog()
+    try:
+        cat.update(catalog.Catalog(), match_mode='bogus')
+    except ValueError as exc:
+        assert 'match_mode' in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError('expected ValueError')
