@@ -1,6 +1,14 @@
 Babel Changelog
 ===============
 
+Version 2.19.0
+--------------
+
+Features
+~~~~~~~~
+
+* Numbers: Add `babel.numbers.parse_currency` to parse a localized currency amount into a `decimal.Decimal` and an ISO 4217 code, matching the locale's currency patterns (symbol position, accounting negatives, no-break spaces, numbering systems and grouping rules), reporting ambiguous symbols and the consumed span
+
 Version 2.18.0
 --------------
 

@@ -181,3 +181,43 @@ Examples:
     >>> parse_number('123 4567', locale='ru')
       ...
     NumberFormatError: '123 4567' is not a valid number
+
+Parsing Currencies
+------------------
+
+`parse_currency` parses a localized currency amount into a
+`decimal.Decimal` and an ISO 4217 currency code.  The locale's currency
+patterns are matched, including the symbol position, accounting negatives
+(parentheses), no-break spaces, numbering systems and grouping rules:
+
+.. code-block:: pycon
+
+    >>> from babel.numbers import parse_currency
+    >>> parse_currency('1.234,50  €', locale='de', currencies={'EUR'})
+    [CurrencyParseResult(amount=Decimal('1234.50'), currency='EUR', start=0, end=10)]
+    >>> parse_currency('($1,234.50)', locale='en_US', currencies={'USD'})
+    [CurrencyParseResult(amount=Decimal('-1234.50'), currency='USD', start=0, end=11)]
+
+The amount is never rounded to the currency's precision; conversion and cash
+rounding are left to the caller.  Each result carries the consumed span of
+the input string, so unrelated trailing text remains at ``string[end:]``.
+
+When a symbol (such as ``$``) may refer to several of the allowed
+currencies, all candidates are returned instead of picking one arbitrarily:
+
+.. code-block:: pycon
+
+    >>> [r.currency for r in parse_currency('$1.00', locale='en_US', currencies={'USD', 'CAD'})]
+    ['CAD', 'USD']
+
+If the string contains no currency marker at all, the caller must provide
+the currency explicitly with ``default_currency``:
+
+.. code-block:: pycon
+
+    >>> parse_currency('(1,234.50)', locale='en_US', default_currency='USD')
+    [CurrencyParseResult(amount=Decimal('-1234.50'), currency='USD', start=0, end=10)]
+
+With ``strict=True``, irregularly grouped numbers are rejected.  In the
+default lenient mode, an ambiguous grouping yields separate results with
+different amounts instead of a single, arbitrary value.
