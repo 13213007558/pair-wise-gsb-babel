@@ -20,7 +20,12 @@ from babel.core import Locale, UnknownLocaleError
 from babel.dates import format_datetime
 from babel.messages import Message, checkers
 from babel.messages.catalog import TranslationError
-from babel.messages.checkers import _validate_format, python_format
+from babel.messages.checkers import (
+    _validate_brace_format,
+    _validate_format,
+    python_brace_format,
+    python_format,
+)
 from babel.messages.plurals import PLURALS
 from babel.messages.pofile import read_po
 from babel.util import LOCALTZ
@@ -416,3 +421,224 @@ def test__validate_format_invalid(msgid, msgstr, error):
 )
 def test__validate_format_valid(msgid, msgstr):
     _validate_format(msgid, msgstr)
+
+
+@pytest.mark.parametrize(
+    ('msgid', 'msgstr'),
+    [
+        # missing placeholders (root arguments)
+        ('{name}', 'Hallo'),
+        ('{name} {pet}', '{name}'),
+        ('{0} {1}', '{0}'),
+        ('{} {}', '{0}'),
+        # additional placeholders in the translation
+        ('{name}', '{name} {pet}'),
+        ('{0}', '{0} {1}'),
+        # renamed placeholder changes the parameter contract
+        ('{name!r:>{width}}', '{name}'),
+        ('{name}', '{named}'),
+        # missing or differing access paths
+        ('{user.name}', '{user}'),
+        ('{user}', '{user.name}'),
+        ('{items[0]}', '{items[1]}'),
+        ('{items[0]}', '{items.name}'),
+        # incompatible conversions and presentation types
+        ('{name!r}', '{name}'),
+        ('{name!r}', '{name!a}'),
+        ('{count:d}', '{count:s}'),
+        ('{count:d}', '{count:f}'),
+        # syntax errors
+        ('{} {0}', '{} {0}'),  # mixes automatic and manual numbering
+        ('{0} {}', '{0} {}'),  # mixes manual and automatic numbering
+        ('{name}', '{name'),  # unbalanced braces
+        ('{a:{b}}', '{a:{b}'),  # broken nested format spec
+        ('{name!x}', '{name!x}'),  # unknown conversion specifier
+        # pluralizable messages
+        (('{count} file', '{count} files'), ('{count} file', 'files')),
+        (('{count} file', '{count} files'), ('file', '{count} files')),
+    ],
+)
+def test_python_brace_format_invalid(msgid, msgstr):
+    msg = Message(msgid, msgstr)
+    with pytest.raises(TranslationError):
+        python_brace_format(None, msg)
+
+
+@pytest.mark.parametrize(
+    ('msgid', 'msgstr'),
+    [
+        ('{name}', '{name}'),
+        ('{name}', ''),  # untranslated
+        # placeholders may be reordered
+        ('{0} {1}', '{1} {0}'),
+        ('{name} {pet}', '{pet} {name}'),
+        # automatic numbering in the msgid, explicit in the translation
+        ('{} {}', '{1} {0}'),
+        # attribute and subscript access
+        ('{user.name}', '{user.name}'),
+        ('{items[0]}', '{items[0]}'),
+        ('{user.address[0]}', '{user.address[0]}'),
+        # placeholders nested in the format spec
+        ('{name:>{width}}', '{name:>{width}}'),
+        ('{name!r:>{width}}', '{name!r:>{width}}'),
+        # compatible conversions and presentation types
+        ('{name}', '{name:s}'),
+        ('{name!s}', '{name}'),
+        ('{count:d}', '{count:x}'),
+        ('{value:f}', '{value:g}'),
+        # escaped braces are literals, not placeholders
+        ('{{name}}', '{{name}}'),
+        ('{name}', '{{{name}}}'),
+        # pluralizable messages
+        (('{count} file', '{count} files'), ('{count} Datei', '{count} Dateien')),
+        (('{count} file', '{count} files'), ('{count} Datei', '{count} Dateien', '')),
+    ],
+)
+def test_python_brace_format_valid(msgid, msgstr):
+    msg = Message(msgid, msgstr)
+    python_brace_format(None, msg)
+
+
+@pytest.mark.parametrize(
+    ('msgid', 'msgstr', 'error'),
+    [
+        (
+            '{name!r:>{width}}',
+            '{name}',
+            "incompatible conversion for placeholder 'name': 'r' and None are not compatible",
+        ),
+        (
+            '{name!r}',
+            '{name!a}',
+            "incompatible conversion for placeholder 'name': 'r' and 'a' are not compatible",
+        ),
+        (
+            '{count:d}',
+            '{count:s}',
+            "incompatible format for placeholder 'count': 'd' and 's' are not compatible",
+        ),
+        ('{name} {pet}', '{name}', "missing placeholder 'pet'"),
+        ('{0} {1}', '{0}', "missing placeholder '1'"),
+        ('{name}', '{name} {pet}', "unknown placeholder 'pet'"),
+        ('{user.name}', '{user}', "missing placeholder 'user.name'"),
+        ('{user}', '{user.name}', "missing placeholder 'user'"),
+        ('{items[0]}', '{items[1]}', r"missing placeholder 'items\[0\]'"),
+        (
+            '{} {0}',
+            '{} {0}',
+            'cannot switch from automatic field numbering to manual field specification',
+        ),
+        (
+            '{0} {}',
+            '{0} {}',
+            'cannot switch from manual field specification to automatic field numbering',
+        ),
+        ('{name}', '{name', 'invalid brace format string'),
+        ('{a:{b}', '{a:{b}', 'invalid brace format string'),
+        ('{name!x}', '{name!x}', "unknown conversion specifier 'x'"),
+    ],
+)
+def test__validate_brace_format_invalid(msgid, msgstr, error):
+    with pytest.raises(TranslationError, match=error):
+        _validate_brace_format(msgid, msgstr)
+
+
+@pytest.mark.parametrize(
+    ('msgid', 'msgstr'),
+    [
+        ('{name}', '{name}'),
+        ('{0} {1}', '{1} {0}'),
+        ('{} {}', '{1} {0}'),
+        ('{user.name}', '{user.name}'),
+        ('{items[0]}', '{items[0]}'),
+        ('{name:>{width}}', '{name:>{width}}'),
+        ('{a:{b:{c}}}', '{a:{b:{c}}}'),
+        ('{:{}}', '{:{}}'),
+        ('{name}', '{name:s}'),
+        ('{name!s}', '{name}'),
+        ('{count:d}', '{count:x}'),
+        ('{value:f}', '{value:g}'),
+        ('{{name}}', '{{name}}'),
+        ('{name}', '{{{name}}}'),
+    ],
+)
+def test__validate_brace_format_valid(msgid, msgstr):
+    _validate_brace_format(msgid, msgstr)
+
+
+def test_python_brace_format_plural_branch_located():
+    # errors are located to the plural form they occurred in
+    msg = Message(('{count} file', '{count} files'), ('{count} Datei', 'Dateien'))
+    with pytest.raises(TranslationError, match=r"plural form 1: missing placeholder 'count'"):
+        python_brace_format(None, msg)
+    msg = Message(('{count} file', '{count} files'), ('Datei', '{count} Dateien'))
+    with pytest.raises(TranslationError, match=r"plural form 0: missing placeholder 'count'"):
+        python_brace_format(None, msg)
+
+
+def test_python_brace_format_message_check():
+    # errors are associated with the message they occurred in
+    msg = Message('{name}', '{named}')
+    errors = msg.check()
+    assert len(errors) == 1
+    assert "missing placeholder 'name'" in str(errors[0])
+    msg = Message(('{count} file', '{count} files'), ('{count} Datei', 'Dateien'))
+    errors = msg.check()
+    assert len(errors) == 1
+    assert "plural form 1: missing placeholder 'count'" in str(errors[0])
+
+
+def test_python_brace_format_is_registered():
+    assert python_brace_format in checkers.checkers
+
+
+def test_python_brace_format_does_not_format_user_objects():
+    # A sentinel that explodes on any kind of access; if the checker
+    # detected placeholders by actually formatting user objects, any
+    # of these operations would be triggered.
+    class Sentinel:
+        def __getattr__(self, name):
+            raise AssertionError('attribute access')
+
+        def __getitem__(self, key):
+            raise AssertionError('item access')
+
+        def __format__(self, format_spec):
+            raise AssertionError('format')
+
+        def __repr__(self):
+            raise AssertionError('repr')
+
+        def __str__(self):
+            raise AssertionError('str')
+
+    sentinel = Sentinel()
+    msgid = '{obj.attr} and {obj[0]!r:>{width}}'
+    msgstr = '{obj[0]!r:>{width}} and {obj.attr}'
+    # the static analysis never touches the sentinel ...
+    _validate_brace_format(msgid, msgstr)
+    # ... while actually formatting the string would
+    with pytest.raises(AssertionError):
+        msgid.format(obj=sentinel, width=1)
+
+
+def test_python_brace_format_and_python_format_are_independent():
+    # a message may carry both kinds of placeholders; each checker only
+    # validates its own kind
+    msg = Message('%(pct)d {name}', '%(pct)d {name}')
+    assert 'python-format' in msg.flags
+    assert 'python-brace-format' in msg.flags
+    python_format(None, msg)
+    python_brace_format(None, msg)
+
+    # the brace checker does not care about %-format problems ...
+    bad_percent = Message('%(pct)d {name}', '%(pct)s {name}')
+    python_brace_format(None, bad_percent)
+    with pytest.raises(TranslationError):
+        python_format(None, bad_percent)
+
+    # ... and the %-format checker does not care about brace problems
+    bad_brace = Message('%(pct)d {name}', '%(pct)d {named}')
+    python_format(None, bad_brace)
+    with pytest.raises(TranslationError):
+        python_brace_format(None, bad_brace)
