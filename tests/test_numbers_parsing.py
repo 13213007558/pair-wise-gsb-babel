@@ -69,3 +69,138 @@ def test_parse_decimal_strict_mode():
     assert str(numbers.parse_decimal('2580', locale='en_US', strict=True)) == '2580'
     # High precision numbers should be accepted
     assert str(numbers.parse_decimal('5,000001', locale='fr', strict=True)) == '5.000001'
+
+
+def test_parse_currency_suffix_symbol():
+    results = numbers.parse_currency('1.234,50\xa0€', locale='de_DE', currencies={'EUR'})
+    assert results == [
+        numbers.CurrencyParseResult(decimal.Decimal('1234.50'), 'EUR', 0, 10),
+    ]
+    # A regular space is accepted in place of the no-break space
+    results = numbers.parse_currency('1.234,50 €', locale='de_DE', currencies={'EUR'})
+    assert results[0].amount == decimal.Decimal('1234.50')
+
+
+def test_parse_currency_preserves_fractional_digits():
+    # Fractional digits are kept exactly as given; no cash rounding is applied
+    (result,) = numbers.parse_currency('€1,234.567', locale='en_US', currencies={'EUR'})
+    assert result.amount == decimal.Decimal('1234.567')
+    assert result.amount.as_tuple().exponent == -3
+    (result,) = numbers.parse_currency('1.234,50 €', locale='de_DE', currencies={'EUR'})
+    assert result.amount == decimal.Decimal('1234.50')
+    assert str(result.amount) == '1234.50'
+
+
+def test_parse_currency_accounting_parentheses():
+    (result,) = numbers.parse_currency('($1,234.50)', locale='en_US', currencies={'USD'})
+    assert result.amount == decimal.Decimal('-1234.50')
+    assert result.currency == 'USD'
+    assert (result.start, result.end) == (0, 11)
+    # Parenthesized amount without a symbol, using an explicit default currency
+    (result,) = numbers.parse_currency('(1,234.50)', locale='en_US', default_currency='USD')
+    assert result.amount == decimal.Decimal('-1234.50')
+    assert (result.start, result.end) == (0, 10)
+
+
+def test_parse_currency_minus_sign():
+    (result,) = numbers.parse_currency('-$1,234.50', locale='en_US', currencies={'USD'})
+    assert result.amount == decimal.Decimal('-1234.50')
+    (result,) = numbers.parse_currency('-1.234,50 €', locale='de_DE', currencies={'EUR'})
+    assert result.amount == decimal.Decimal('-1234.50')
+
+
+def test_parse_currency_ambiguous_symbol_depends_on_allowed_set():
+    string = '$1,234.50'
+    # The same symbol yields different results depending on the allowed set;
+    # USD is never picked arbitrarily when several currencies match.
+    assert [r.currency for r in numbers.parse_currency(string, locale='en_US', currencies={'USD'})] == ['USD']  # fmt: skip
+    assert [r.currency for r in numbers.parse_currency(string, locale='en_US', currencies={'CAD'})] == ['CAD']  # fmt: skip
+    results = numbers.parse_currency(string, locale='en_US', currencies={'USD', 'CAD'})
+    assert {r.currency for r in results} == {'USD', 'CAD'}
+    assert {r.amount for r in results} == {decimal.Decimal('1234.50')}
+    # None of the allowed currencies is denoted by the symbol
+    with pytest.raises(numbers.NumberFormatError):
+        numbers.parse_currency(string, locale='en_US', currencies={'EUR'})
+
+
+def test_parse_currency_iso_code_marker():
+    (result,) = numbers.parse_currency('USD 1,234.50', locale='en_US', currencies={'USD'})
+    assert result.amount == decimal.Decimal('1234.50')
+    (result,) = numbers.parse_currency('1,234.50 USD', locale='en_US', currencies={'USD'})
+    assert result.amount == decimal.Decimal('1234.50')
+    # ISO codes should not match inside words
+    with pytest.raises(numbers.NumberFormatError):
+        numbers.parse_currency('TOTALLY 5.00', locale='en_US', currencies={'ALL'})
+
+
+def test_parse_currency_default_currency():
+    (result,) = numbers.parse_currency('1,234.50', locale='en_US', default_currency='USD')
+    assert result.amount == decimal.Decimal('1234.50')
+    assert result.currency == 'USD'
+    # Without a marker and without a default currency, parsing fails
+    with pytest.raises(numbers.NumberFormatError):
+        numbers.parse_currency('1,234.50', locale='en_US')
+    # A default currency is only used when no marker is present
+    (result,) = numbers.parse_currency('€1,234.50', locale='en_US', currencies={'EUR'}, default_currency='USD')  # fmt: skip
+    assert result.currency == 'EUR'
+
+
+def test_parse_currency_unknown_currency():
+    with pytest.raises(numbers.UnknownCurrencyError):
+        numbers.parse_currency('$1.00', locale='en_US', currencies={'ZZZ'})
+    with pytest.raises(numbers.UnknownCurrencyError):
+        numbers.parse_currency('1.00', locale='en_US', default_currency='ZZZ')
+
+
+def test_parse_currency_strict_mode_rejects_misaligned_grouping():
+    with pytest.raises(numbers.NumberFormatError):
+        numbers.parse_currency('$1,23,456.00', locale='en_US', currencies={'USD'}, strict=True)
+    # Properly grouped amounts are accepted
+    (result,) = numbers.parse_currency('$1,234,456.00', locale='en_US', currencies={'USD'}, strict=True)  # fmt: skip
+    assert result.amount == decimal.Decimal('1234456.00')
+
+
+def test_parse_currency_lenient_mode_keeps_both_interpretations():
+    # A misplaced grouping symbol allows two different amount readings;
+    # lenient mode must not collapse them into a single value.
+    results = numbers.parse_currency('$12,34', locale='en_US', currencies={'USD'})
+    assert [r.amount for r in results] == [decimal.Decimal('1234'), decimal.Decimal('12.34')]
+    # Properly grouped input yields a single candidate
+    results = numbers.parse_currency('$1,234.50', locale='en_US', currencies={'USD'})
+    assert [r.amount for r in results] == [decimal.Decimal('1234.50')]
+
+
+def test_parse_currency_consumed_span_leaves_trailing_text():
+    string = '1.234,50\xa0€ zzgl. MwSt.'
+    (result,) = numbers.parse_currency(string, locale='de_DE', currencies={'EUR'})
+    assert string[result.start:result.end] == '1.234,50\xa0€'
+    assert string[result.end:] == ' zzgl. MwSt.'
+    # Leading text is outside the consumed span as well
+    string = 'Preis: 1.234,50\xa0€'
+    (result,) = numbers.parse_currency(string, locale='de_DE', currencies={'EUR'})
+    assert string[result.start:result.end] == '1.234,50\xa0€'
+    assert string[:result.start] == 'Preis: '
+
+
+def test_parse_currency_numbering_system():
+    string = numbers.format_currency(1234.5, 'EGP', locale='ar_EG', numbering_system='default')
+    (result,) = numbers.parse_currency(string, locale='ar_EG', currencies={'EGP'}, numbering_system='default')  # fmt: skip
+    assert result.amount == decimal.Decimal('1234.50')
+    assert result.currency == 'EGP'
+
+
+@pytest.mark.parametrize(('locale', 'currency', 'amount'), [
+    ('en_US', 'USD', '1234.50'),
+    ('de_DE', 'EUR', '1234.50'),
+    ('fr_FR', 'EUR', '12345.50'),
+    ('en_US', 'JPY', '1234'),
+    ('sv_SE', 'SEK', '1234.50'),
+])
+def test_parse_currency_format_roundtrip(locale, currency, amount):
+    value = decimal.Decimal(amount)
+    string = numbers.format_currency(value, currency, locale=locale)
+    results = numbers.parse_currency(string, locale=locale, currencies={currency})
+    assert len(results) == 1
+    assert results[0].amount == value
+    assert results[0].currency == currency
+    assert string[results[0].start:results[0].end] == string

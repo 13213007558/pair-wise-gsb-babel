@@ -25,7 +25,8 @@ import datetime
 import decimal
 import re
 import warnings
-from typing import Any, Literal, cast, overload
+from collections.abc import Iterable
+from typing import Any, Literal, NamedTuple, cast, overload
 
 from babel.core import Locale, default_locale, get_global
 from babel.localedata import LocaleDataDict
@@ -1263,6 +1264,346 @@ def _remove_trailing_zeros_after_decimal(string: str, decimal_symbol: str) -> st
         return integer_part
 
     return string
+
+
+#: Characters that may appear between a currency marker and its number, or
+#: between a number and its sign, without breaking adjacency.
+_FILLER_PATTERN = r'[\s\u200e\u200f\u061c]*'
+_FILLER_RE = re.compile(_FILLER_PATTERN)
+
+
+class CurrencyParseResult(NamedTuple):
+    """A single candidate result of :func:`parse_currency`.
+
+    .. versionadded:: 2.19
+    """
+
+    #: The parsed monetary amount.  Fractional digits are preserved exactly
+    #: as they appeared in the input; no currency-precision (cash) rounding
+    #: is applied.
+    amount: decimal.Decimal
+    #: The ISO 4217 currency code of this candidate.
+    currency: str
+    #: The offset in the input string at which the parsed amount starts.
+    start: int
+    #: The offset in the input string at which the parsed amount ends.
+    #: Any trailing text is left to the caller as ``string[end:]``.
+    end: int
+
+
+_currency_symbol_index: dict[str, frozenset[str]] | None = None
+
+
+def _get_currency_symbol_index() -> dict[str, frozenset[str]]:
+    """Return a mapping of currency symbols to currency codes.
+
+    The index is built from the currency symbols of all locales, so that a
+    symbol shared by several currencies (such as ``$``) maps to all of them.
+    """
+    global _currency_symbol_index
+    if _currency_symbol_index is None:
+        from babel.localedata import locale_identifiers
+
+        index: dict[str, set[str]] = {}
+        for identifier in locale_identifiers():
+            for code, symbol in Locale.parse(identifier).currency_symbols.items():
+                index.setdefault(symbol, set()).add(code)
+        _currency_symbol_index = {
+            symbol: frozenset(codes) for symbol, codes in index.items()
+        }
+    return _currency_symbol_index
+
+
+def _parse_currency_amounts(
+    body: str,
+    locale: Locale,
+    strict: bool,
+    numbering_system: Literal["default"] | str,
+) -> list[decimal.Decimal]:
+    """Parse the numeric part of a currency amount into candidate decimals.
+
+    In strict mode, misaligned grouping raises a `NumberFormatError`.  In
+    lenient mode, a string that allows two different amount interpretations
+    (e.g. a misplaced grouping symbol that could also be a decimal symbol)
+    yields both values instead of silently collapsing them into one.
+    """
+    if strict:
+        return [parse_decimal(body, locale, strict=True, numbering_system=numbering_system)]
+
+    value = parse_decimal(body, locale, numbering_system=numbering_system)
+    amounts = [value]
+
+    group_symbol = get_group_symbol(locale, numbering_system=numbering_system)
+    decimal_symbol = get_decimal_symbol(locale, numbering_system=numbering_system)
+
+    check = body
+    if (
+        group_symbol in SPACE_CHARS
+        and group_symbol not in check
+        and SPACE_CHARS_RE.search(check)
+    ):
+        check = SPACE_CHARS_RE.sub(group_symbol, check)
+
+    if group_symbol in check:
+        proper = format_decimal(
+            value,
+            locale=locale,
+            decimal_quantization=False,
+            numbering_system=numbering_system,
+        )
+        if check != proper and proper != _remove_trailing_zeros_after_decimal(check, decimal_symbol):  # fmt: skip
+            # The grouping is misaligned; the grouping symbol may actually
+            # have been meant as the decimal symbol (or vice versa).
+            try:
+                alt = decimal.Decimal(
+                    check.replace(decimal_symbol, '').replace(group_symbol, '.'),
+                )
+            except decimal.InvalidOperation:
+                pass
+            else:
+                if alt != value:
+                    amounts.append(alt)
+    return amounts
+
+
+def parse_currency(
+    string: str,
+    locale: Locale | str | None = None,
+    currencies: Iterable[str] | None = None,
+    default_currency: str | None = None,
+    strict: bool = False,
+    *,
+    numbering_system: Literal["default"] | str = "latn",
+) -> list[CurrencyParseResult]:
+    """Parse a localized currency amount into a Decimal and a currency code.
+
+    The input is matched against the locale's currency pattern, including
+    the symbol position, accounting-style negative amounts in parentheses,
+    no-break spaces, numbering systems and grouping rules:
+
+    >>> parse_currency('1.234,50\\xa0€', locale='de_DE', currencies={'EUR'})
+    [CurrencyParseResult(amount=Decimal('1234.50'), currency='EUR', start=0, end=10)]
+    >>> parse_currency('($1,234.50)', locale='en_US', currencies={'USD'})
+    [CurrencyParseResult(amount=Decimal('-1234.50'), currency='USD', start=0, end=11)]
+
+    The fractional digits are preserved exactly as given; quantization to
+    the currency's precision (cash rounding) and any currency conversion
+    are left to the caller:
+
+    >>> parse_currency('€1,234.567', locale='en_US', currencies={'EUR'})
+    [CurrencyParseResult(amount=Decimal('1234.567'), currency='EUR', start=0, end=10)]
+
+    A single symbol may denote several of the allowed currencies.  In that
+    case one candidate per currency is returned instead of an arbitrary
+    pick; the result depends on the allowed set:
+
+    >>> [r.currency for r in parse_currency('$1,234.50', locale='en_US', currencies={'USD'})]
+    ['USD']
+    >>> [r.currency for r in parse_currency('$1,234.50', locale='en_US', currencies={'USD', 'CAD'})]
+    ['CAD', 'USD']
+    >>> [r.currency for r in parse_currency('$1,234.50', locale='en_US', currencies={'CAD'})]
+    ['CAD']
+
+    If the string contains no currency symbol or code, the currency must be
+    given explicitly via `default_currency`:
+
+    >>> parse_currency('1,234.50', locale='en_US', default_currency='USD')
+    [CurrencyParseResult(amount=Decimal('1234.50'), currency='USD', start=0, end=8)]
+    >>> parse_currency('1,234.50', locale='en_US')
+    Traceback (most recent call last):
+        ...
+    NumberFormatError: could not parse a currency amount from '1,234.50' and no default_currency given
+
+    Each result carries the consumed span, so unrelated trailing text can
+    be recovered by the caller:
+
+    >>> result = parse_currency('1.234,50 € zzgl. MwSt.', locale='de_DE', currencies={'EUR'})[0]
+    >>> result.end
+    10
+    >>> '1.234,50 € zzgl. MwSt.'[result.end:]
+    ' zzgl. MwSt.'
+
+    With `strict` set to `True`, misaligned grouping is rejected:
+
+    >>> parse_currency('$12,34', locale='en_US', currencies={'USD'}, strict=True)
+    Traceback (most recent call last):
+        ...
+    NumberFormatError: '12,34' is not a properly formatted decimal number. Did you mean '1,234'? Or maybe '12.34'?
+
+    In lenient mode the same input yields both amount interpretations
+    instead of collapsing them into a single value:
+
+    >>> [r.amount for r in parse_currency('$12,34', locale='en_US', currencies={'USD'})]
+    [Decimal('1234'), Decimal('12.34')]
+
+    :param string: the string to parse
+    :param locale: the `Locale` object or locale identifier. Defaults to the
+                   system currency locale or numeric locale.
+    :param currencies: the allowed currency codes.  If several of them can be
+                       denoted by the same symbol, one candidate per currency
+                       is returned.  If not given, all known currencies are
+                       allowed; passing an explicit set is recommended to
+                       avoid spurious matches.
+    :param default_currency: the currency code to assume when the string
+                             contains no currency symbol or code.  If not
+                             given, such input raises a `NumberFormatError`.
+    :param strict: controls whether numbers formatted in a weird way are
+                   accepted or rejected
+    :param numbering_system: The numbering system used for parsing. Defaults to "latn".
+                             The special value "default" will use the default numbering system of the locale.
+    :return: a list of `CurrencyParseResult` candidates
+    :raise `NumberFormatError`: if no currency amount can be parsed
+    :raise `UnknownCurrencyError`: if a currency in `currencies` or
+                                      `default_currency` is unknown
+    :raise `UnsupportedNumberingSystemError`: if the numbering system is not supported by the locale.
+
+    .. versionadded:: 2.19
+    """
+    locale = Locale.parse(locale or LC_MONETARY)
+
+    if currencies is None:
+        allowed = None
+    else:
+        allowed = set()
+        for currency in currencies:
+            normalized = normalize_currency(currency)
+            if normalized is None:
+                raise UnknownCurrencyError(currency)
+            allowed.add(normalized)
+
+    default = None
+    if default_currency is not None:
+        default = normalize_currency(default_currency)
+        if default is None:
+            raise UnknownCurrencyError(default_currency)
+
+    group_symbol = get_group_symbol(locale, numbering_system=numbering_system)
+    decimal_symbol = get_decimal_symbol(locale, numbering_system=numbering_system)
+    minus_sign = get_minus_sign_symbol(locale, numbering_system=numbering_system)
+    plus_sign = get_plus_sign_symbol(locale, numbering_system=numbering_system)
+
+    signs = {minus_sign, plus_sign, '-', '+', '\u2212'}
+    sign_re = '|'.join(sorted((re.escape(s) for s in signs), key=len, reverse=True))
+
+    def is_minus(sign: str | None) -> bool:
+        return sign is not None and ('-' in sign or '\u2212' in sign)
+
+    # A number token: an optional sign, then a run of digits, grouping and
+    # decimal symbols (and spaces, for space-grouped locales) ending in a digit.
+    separators = re.escape(group_symbol + decimal_symbol)
+    body_re = rf'(?:[{separators}\d][{separators}\d\s]*\d|\d)'
+    token_re = re.compile(
+        rf'(?:(?P<lead_sign>{sign_re}){_FILLER_PATTERN})?'
+        rf'(?P<body>{body_re})'
+        rf'(?P<trail_sign>{_FILLER_PATTERN}(?:{sign_re}))?',
+    )
+    tokens = [
+        (m.start(), m.end(), m.group('lead_sign'), m.group('trail_sign'), m.group('body'))
+        for m in token_re.finditer(string)
+    ]
+
+    # Whether the locale's currency pattern places the currency symbol
+    # before (prefix) or after (suffix) the number.
+    pattern = locale.currency_formats.get('standard')
+    symbol_is_prefix = bool(pattern) and any('\u00a4' in p for p in pattern.prefix)
+
+    def find_adjacent_token(marker_start: int, marker_end: int):
+        candidates = []
+        for token in tokens:
+            token_start, token_end = token[0], token[1]
+            if token_end <= marker_start and _FILLER_RE.fullmatch(string[token_end:marker_start]):
+                # Number before the symbol (suffix pattern).
+                priority = 0 if not symbol_is_prefix else 1
+                candidates.append((priority, marker_start - token_end, token))
+            elif token_start >= marker_end and _FILLER_RE.fullmatch(string[marker_end:token_start]):
+                # Number after the symbol (prefix pattern).
+                priority = 0 if symbol_is_prefix else 1
+                candidates.append((priority, token_start - marker_end, token))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
+        return candidates[0][2]
+
+    def extend_span(start: int, end: int, lead_sign: str | None, trail_sign: str | None):
+        negative = is_minus(lead_sign) or is_minus(trail_sign)
+        # A sign directly outside the consumed region, e.g. the leading
+        # minus in "-$5.00".
+        match = re.search(rf'({sign_re}){_FILLER_PATTERN}$', string[:start])
+        if match:
+            negative = negative or is_minus(match.group(1))
+            start = match.start(1)
+        match = re.match(rf'{_FILLER_PATTERN}({sign_re})', string[end:])
+        if match:
+            negative = negative or is_minus(match.group(1))
+            end += match.end()
+        # Accounting-style parentheses around the whole amount, e.g. "($5.00)".
+        opening = re.search(rf'\({_FILLER_PATTERN}$', string[:start])
+        closing = re.match(rf'{_FILLER_PATTERN}\)', string[end:])
+        if opening and closing:
+            negative = True
+            start = opening.start()
+            end += closing.end()
+        return start, end, negative
+
+    def build_results(codes, token, marker_start: int, marker_end: int):
+        token_start, token_end, lead_sign, trail_sign, body = token
+        amounts = _parse_currency_amounts(body.strip(), locale, strict, numbering_system)
+        start, end, negative = extend_span(
+            min(token_start, marker_start),
+            max(token_end, marker_end),
+            lead_sign,
+            trail_sign,
+        )
+        if negative:
+            amounts = [-amount for amount in amounts]
+        results = []
+        seen = set()
+        for code in sorted(codes):
+            for amount in amounts:
+                if (code, amount) not in seen:
+                    seen.add((code, amount))
+                    results.append(CurrencyParseResult(amount, code, start, end))
+        return results
+
+    index = _get_currency_symbol_index()
+    markers: dict[str, set[str]] = {}
+    for symbol, codes in index.items():
+        if allowed is not None:
+            codes = codes & allowed
+        if codes:
+            markers.setdefault(symbol, set()).update(codes)
+    for code in (allowed if allowed is not None else list_currencies()):
+        markers.setdefault(code, set()).add(code)
+
+    if markers:
+        parts = []
+        for marker in sorted(markers, key=len, reverse=True):
+            escaped = re.escape(marker)
+            if marker.isascii() and marker.isalpha():
+                # ISO codes should not match inside words.
+                parts.append(rf'(?<![A-Za-z]){escaped}(?![A-Za-z])')
+            else:
+                parts.append(escaped)
+        marker_re = re.compile('|'.join(parts))
+        for match in marker_re.finditer(string):
+            token = find_adjacent_token(match.start(), match.end())
+            if token is None:
+                continue
+            return build_results(markers[match.group()], token, match.start(), match.end())
+
+    if default is None:
+        raise NumberFormatError(
+            f"could not parse a currency amount from {string!r} and no default_currency given",
+        )
+
+    for token in tokens:
+        try:
+            results = build_results({default}, token, token[0], token[1])
+        except NumberFormatError:
+            continue
+        if results:
+            return results
+    raise NumberFormatError(f"{string!r} does not contain a parseable number")
 
 
 _number_pattern_re = re.compile(

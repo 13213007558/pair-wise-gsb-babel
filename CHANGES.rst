@@ -1,6 +1,19 @@
 Babel Changelog
 ===============
 
+Version 2.19.0
+--------------
+
+(Unreleased)
+
+Features
+~~~~~~~~
+
+* Numbers: Add `babel.numbers.parse_currency()` for parsing localized currency
+  amounts (symbol position, accounting negatives, no-break spaces, numbering
+  systems and grouping rules) into Decimal amounts and currency codes, with
+  ambiguity candidates, an explicit default currency and consumed spans.
+
 Version 2.18.0
 --------------
 

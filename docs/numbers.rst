@@ -181,3 +181,33 @@ Examples:
     >>> parse_number('123 4567', locale='ru')
       ...
     NumberFormatError: '123 4567' is not a valid number
+
+Parsing Currencies
+==================
+
+Babel can also parse a monetary amount and resolve its currency marker
+against the currency pattern of the locale and a set of allowed currencies:
+
+.. code-block:: pycon
+
+    >>> from babel.numbers import parse_currency
+    >>> parse_currency('1.234,50\xa0€', locale='de_DE', currencies={'EUR'})
+    [CurrencyParseResult(amount=Decimal('1234.50'), currency='EUR', start=0, end=10)]
+    >>> parse_currency('($1,234.50)', locale='en_US', currencies={'USD'})
+    [CurrencyParseResult(amount=Decimal('-1234.50'), currency='USD', start=0, end=11)]
+
+A symbol that may denote several of the allowed currencies (such as dollar)
+produces one candidate per currency instead of an arbitrary pick.  If the
+string contains no currency symbol or code, the currency has to be supplied
+explicitly:
+
+.. code-block:: pycon
+
+    >>> [r.currency for r in parse_currency('\$1,234.50', locale='en_US', currencies={'USD', 'CAD'})]
+    ['CAD', 'USD']
+    >>> parse_currency('1,234.50', locale='en_US', default_currency='USD')
+    [CurrencyParseResult(amount=Decimal('1234.50'), currency='USD', start=0, end=8)]
+
+Each result carries the consumed span, so unrelated trailing text is left
+to the caller.  The fractional digits are preserved exactly as given;
+cash rounding and currency conversion are left to the application.
