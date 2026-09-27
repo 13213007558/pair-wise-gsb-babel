@@ -11,7 +11,7 @@
 # history and logs, available at https://github.com/python-babel/babel/commits/master/.
 
 import calendar
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 
 import freezegun
 import pytest
@@ -534,6 +534,152 @@ def test_parse_time_custom_format():
 def test_parse_errors(case, func):
     with pytest.raises(dates.ParseError):
         func(case, locale='en_US')
+
+
+def test_parse_datetime_pattern_basic():
+    result = dates.parse_datetime_pattern(
+        "5 Sep 2026 at 14:30", "d MMM y 'at' HH:mm", locale='en_US',
+    )
+    assert result == {'year': 2026, 'month': 9, 'day': 5, 'hour': 14, 'minute': 30}
+
+
+def test_parse_datetime_pattern_only_parsed_fields_returned():
+    assert dates.parse_datetime_pattern('14:30', 'HH:mm', locale='en_US') == {
+        'hour': 14,
+        'minute': 30,
+    }
+    assert dates.parse_datetime_pattern('2026', 'y', locale='en_US') == {'year': 2026}
+
+
+def test_parse_datetime_pattern_accepts_pattern_object():
+    pattern = dates.parse_pattern('d MMM y')
+    assert dates.parse_datetime_pattern('5 Sep 2026', pattern, locale='en_US') == {
+        'year': 2026,
+        'month': 9,
+        'day': 5,
+    }
+
+
+@pytest.mark.parametrize(('string', 'pattern', 'locale', 'expected'), [
+    # month names are recognized per locale, not by number order
+    ('5. März 2026', 'd. MMMM y', 'de_DE', {'year': 2026, 'month': 3, 'day': 5}),
+    ('5 Sept. 2026', 'd MMM y', 'de_DE', {'year': 2026, 'month': 9, 'day': 5}),
+    ('5 septiembre 2026', 'd MMMM y', 'es', {'year': 2026, 'month': 9, 'day': 5}),
+    # numeric months
+    ('2026-09-05', 'y-M-d', 'en_US', {'year': 2026, 'month': 9, 'day': 5}),
+    # 12-hour clocks with day periods
+    ('2:30 PM', 'h:mm a', 'en_US', {'hour': 14, 'minute': 30, 'day_period': 'pm'}),
+    ('12:30 AM', 'h:mm a', 'en_US', {'hour': 0, 'minute': 30, 'day_period': 'am'}),
+    ('11 pm', 'K a', 'en_US', {'hour': 23, 'day_period': 'pm'}),
+    # noon and midnight
+    ('12:00 noon', 'h:mm b', 'en_US', {'hour': 12, 'minute': 0, 'day_period': 'noon'}),
+    ('12:00 midnight', 'h:mm b', 'en_US', {'hour': 0, 'minute': 0, 'day_period': 'midnight'}),
+    # 24-hour clock edge cases
+    ('24:00', 'kk:mm', 'en_US', {'hour': 0, 'minute': 0}),
+    # fractional seconds
+    (
+        '14:30:05.25',
+        'HH:mm:ss.SS',
+        'en_US',
+        {'hour': 14, 'minute': 30, 'second': 5, 'microsecond': 250000},
+    ),
+])
+def test_parse_datetime_pattern_fields(string, pattern, locale, expected):
+    assert dates.parse_datetime_pattern(string, pattern, locale=locale) == expected
+
+
+def test_parse_datetime_pattern_quoted_literals():
+    assert dates.parse_datetime_pattern("14 o'clock", "HH 'o''clock'", locale='en_US') == {
+        'hour': 14,
+    }
+    # quoted pattern letters are matched literally, not parsed as fields
+    assert dates.parse_datetime_pattern('5 at 14', "d 'at' HH", locale='en_US') == {
+        'day': 5,
+        'hour': 14,
+    }
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime_pattern('5 Sep 2026', "d 'MMM' y", locale='en_US')
+
+
+def test_parse_datetime_pattern_weekday():
+    # 2026-09-25 is a Friday
+    result = dates.parse_datetime_pattern(
+        'Friday, 25 Sep 2026', 'EEEE, d MMM y', locale='en_US',
+    )
+    assert result == {'year': 2026, 'month': 9, 'day': 25, 'weekday': 4}
+    with pytest.raises(dates.ParseError, match='[Ww]eekday'):
+        dates.parse_datetime_pattern('Thursday, 25 Sep 2026', 'EEEE, d MMM y', locale='en_US')
+
+
+def test_parse_datetime_pattern_repeated_fields_must_agree():
+    assert dates.parse_datetime_pattern('2020-2020', 'y-y', locale='en_US') == {'year': 2020}
+    with pytest.raises(dates.ParseError, match='[Cc]onflicting'):
+        dates.parse_datetime_pattern('2020-2021', 'y-y', locale='en_US')
+    with pytest.raises(dates.ParseError, match='[Cc]onflicting'):
+        dates.parse_datetime_pattern('10:30 11:30', 'HH:mm HH:mm', locale='en_US')
+
+
+def test_parse_datetime_pattern_two_digit_year_requires_pivot():
+    with pytest.raises(dates.ParseError, match='pivot'):
+        dates.parse_datetime_pattern('25/09/26', 'dd/MM/yy', locale='en_US')
+    # the pivot defines a 100-year window around it
+    assert dates.parse_datetime_pattern('25/09/26', 'dd/MM/yy', locale='en_US', pivot=2030) == {
+        'year': 2026,
+        'month': 9,
+        'day': 25,
+    }
+    assert dates.parse_datetime_pattern('25/09/99', 'dd/MM/yy', locale='en_US', pivot=2030) == {
+        'year': 1999,
+        'month': 9,
+        'day': 25,
+    }
+
+
+def test_parse_datetime_pattern_leap_day():
+    assert dates.parse_datetime_pattern('29 Feb 2024', 'd MMM y', locale='en_US') == {
+        'year': 2024,
+        'month': 2,
+        'day': 29,
+    }
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime_pattern('29 Feb 2025', 'd MMM y', locale='en_US')
+
+
+def test_parse_datetime_pattern_timezone_offsets():
+    tzinfo = dates.parse_datetime_pattern('14:30+02:00', 'HH:mmXXX', locale='en_US')['tzinfo']
+    assert tzinfo == timezone(timedelta(hours=2))
+    tzinfo = dates.parse_datetime_pattern('14:30+0200', 'HH:mmZ', locale='en_US')['tzinfo']
+    assert tzinfo == timezone(timedelta(hours=2))
+    tzinfo = dates.parse_datetime_pattern('14:30-0530', 'HH:mmZ', locale='en_US')['tzinfo']
+    assert tzinfo == timezone(timedelta(hours=-5, minutes=-30))
+    # 'X' accepts 'Z' for UTC
+    assert dates.parse_datetime_pattern('14:30Z', 'HH:mmX', locale='en_US')['tzinfo'] == UTC
+    # ... but 'x' and 'Z' require a numeric offset
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime_pattern('14:30Z', 'HH:mmZ', locale='en_US')
+
+
+@pytest.mark.parametrize('pattern', [
+    'y G',  # era
+    'y Q',  # quarter
+    'w y',  # week of year
+    'HH:mm z',  # timezone names (incl. DST-specific names)
+    'HH:mm v',
+    'HH:mm V',
+    'HH:mm O',
+])
+def test_parse_datetime_pattern_unsupported_fields(pattern):
+    with pytest.raises(NotImplementedError):
+        dates.parse_datetime_pattern('whatever', pattern, locale='en_US')
+
+
+def test_parse_datetime_pattern_mismatch():
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime_pattern('not a date', 'd MMM y', locale='en_US')
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime_pattern('13:00 AM', 'HH:mm a', locale='en_US')
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime_pattern('25:00', 'HH:mm', locale='en_US')
 
 
 def test_datetime_format_get_week_number():

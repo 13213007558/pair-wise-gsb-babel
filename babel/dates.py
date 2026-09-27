@@ -1390,6 +1390,336 @@ def parse_time(
     return datetime.time(hour, minute, second)
 
 
+#: Field characters that can be parsed by parse_datetime_pattern.
+_PARSEABLE_FIELD_CHARS = frozenset('yYuMLdhHKkmsSEecabBZxX')
+
+#: Day period keys understood for the b/B fields in addition to am/pm.
+_EXTENDED_DAY_PERIODS = ('noon', 'midnight')
+
+#: Matches a numeric timezone offset such as +02, +0200, +02:00, or +02:00:30.
+_TZ_OFFSET_RE = re.compile(r'([+-])(\d{2})(?::?(\d{2}))?(?::?(\d{2}))?$')
+
+
+def _local_name_lookup(data: LocaleDataDict, keys: Iterable) -> dict[str, object]:
+    '''Build a case-insensitive lookup of localized names to their keys.
+
+    Names are collected from both the format and stand-alone contexts and from
+    all available widths, so that e.g. both wide and abbreviated month names
+    are recognized regardless of the exact field width in the pattern.
+    '''
+    lookup: dict[str, object] = {}
+    for context in ('format', 'stand-alone'):
+        for width in ('wide', 'abbreviated', 'short', 'narrow'):
+            try:
+                names = data[context][width]
+            except KeyError:
+                continue
+            for key in keys:
+                name = names.get(key)
+                if name:
+                    lookup.setdefault(str(name).lower(), key)
+    return lookup
+
+
+def _name_alternation(lookup: dict[str, object]) -> str:
+    '''Build a regex alternation matching any of the given localized names.'''
+    if not lookup:
+        return '(?!)'  # never matches
+    return '(?:%s)' % '|'.join(
+        re.escape(name) for name in sorted(lookup, key=len, reverse=True)
+    )
+
+
+def _apply_year_pivot(year: int, pivot: int) -> int:
+    '''Map a two-digit year into the 100-year window around pivot.
+
+    The window spans pivot - 50 to pivot + 49 (inclusive), so the resolved
+    year is always within 50 years of the pivot.
+    '''
+    resolved = (pivot // 100) * 100 + year
+    if resolved < pivot - 50:
+        resolved += 100
+    elif resolved > pivot + 49:
+        resolved -= 100
+    return resolved
+
+
+def _parse_tz_offset(text: str, allow_zulu: bool) -> datetime.timezone:
+    '''Parse a numeric timezone offset into a datetime.timezone.'''
+    if allow_zulu and text.upper() == 'Z':
+        return UTC
+    match = _TZ_OFFSET_RE.match(text)
+    if not match:
+        raise ParseError(f"Invalid timezone offset: {text!r}")
+    sign, hours, minutes, seconds = match.groups()
+    offset = datetime.timedelta(
+        hours=int(hours),
+        minutes=int(minutes or 0),
+        seconds=int(seconds or 0),
+    )
+    if sign == '-':
+        offset = -offset
+    if not -datetime.timedelta(hours=24) < offset < datetime.timedelta(hours=24):
+        raise ParseError(f"Timezone offset out of range: {text!r}")
+    return datetime.timezone(offset)
+
+
+def parse_datetime_pattern(
+    string: str,
+    pattern: str | DateTimePattern,
+    locale: Locale | str | None = None,
+    *,
+    pivot: int | None = None,
+) -> dict[str, object]:
+    '''Parse a date and/or time from a string according to an explicit pattern.
+
+    Unlike parse_date and parse_time, which guess the field order from the
+    positions of numbers in the input, this function matches the input against
+    the given date/time pattern (the same pattern syntax used by
+    format_datetime), recognizing localized names such as month names in the
+    given locale:
+
+    >>> parse_datetime_pattern("5 Sep 2026 at 14:30", "d MMM y 'at' HH:mm", locale='en')
+    {'year': 2026, 'month': 9, 'day': 5, 'hour': 14, 'minute': 30}
+
+    Quoted text in the pattern is matched literally and is never interpreted
+    as pattern letters:
+
+    >>> parse_datetime_pattern("14 o'clock", "HH 'o''clock'", locale='en')
+    {'hour': 14}
+
+    Only the fields actually present in the pattern (and the input) appear in
+    the result; nothing is defaulted:
+
+    >>> parse_datetime_pattern("14:30", "HH:mm", locale='en')
+    {'hour': 14, 'minute': 30}
+
+    The supported fields are: year (``y``, ``Y``, ``u``), month as a number or
+    localized name (``M``, ``L``), day of month (``d``), weekday names (``E``,
+    ``e``, ``c``), 24- and 12-hour clock hours (``H``, ``k``, ``h``, ``K``),
+    minute (``m``), second (``s``), fractional seconds (``S``), day periods
+    including noon and midnight (``a``, ``b``, ``B``), and numeric timezone
+    offsets (``Z``, ``x``, ``X``; ``X`` also accepts ``Z`` for UTC).
+
+    If a field occurs multiple times, all occurrences must agree. A weekday
+    must be consistent with the parsed date. Two-digit years (``yy``) are only
+    resolved when an explicit ``pivot`` year is given; the year is then
+    resolved into the 100-year window from ``pivot - 50`` to ``pivot + 49``.
+
+    Era, quarter, week-of-year, and timezone-name fields (including
+    DST-specific timezone names, e.g. ``z`` or ``v``) as well as non-Gregorian
+    calendar symbols are not supported and raise NotImplementedError.
+
+    :param string: the string to parse
+    :param pattern: the date/time pattern to parse the string with
+    :param locale: a Locale object or a locale identifier. Defaults to the
+                   system time locale.
+    :param pivot: the pivot year used to resolve two-digit years; required if
+                  the pattern contains a two-digit year field (``yy``)
+    :return: a dictionary with a subset of the keys ``year``, ``month``,
+             ``day``, ``weekday``, ``hour``, ``minute``, ``second``,
+             ``microsecond``, ``day_period``, and ``tzinfo``
+    :raise ParseError: if the string does not match the pattern, or fields are
+                       inconsistent or out of range
+    :raise NotImplementedError: if the pattern contains unsupported fields
+    '''
+    locale = Locale.parse(locale or LC_TIME)
+    if isinstance(pattern, DateTimePattern):
+        pattern = pattern.pattern
+    tokens = tokenize_pattern(pattern)
+
+    if pivot is None and any(
+        tok_type == 'field' and tok_value[0] in 'yYu' and tok_value[1] == 2
+        for tok_type, tok_value in tokens
+    ):
+        raise ParseError(
+            "The pattern contains a two-digit year field; "
+            "pass an explicit `pivot` year to resolve it",
+        )
+
+    month_names = _local_name_lookup(locale.months, range(1, 13))
+    weekday_names = _local_name_lookup(locale.days, range(7))
+    period_names = _local_name_lookup(
+        locale.day_periods, ('am', 'pm', *_EXTENDED_DAY_PERIODS),
+    )
+
+    regex_parts = []
+    fields: list[tuple[str, int]] = []
+    for tok_type, tok_value in tokens:
+        if tok_type == 'chars':
+            regex_parts.append(re.escape(tok_value))
+            continue
+        char, num = tok_value
+        if char not in _PARSEABLE_FIELD_CHARS:
+            if char in ('z', 'v', 'V', 'O'):
+                raise NotImplementedError(
+                    f"Parsing of timezone names (field {char!r}), including "
+                    "DST-specific names, is not supported; use a numeric "
+                    "timezone offset field (Z, x or X) instead",
+                )
+            raise NotImplementedError(
+                f"Parsing of the {char!r} field is not supported",
+            )
+        fields.append((char, num))
+        if char in 'yYu':
+            regex_parts.append(r'(\d{2})' if num == 2 else r'(\d+)')
+        elif char in 'ML':
+            regex_parts.append(
+                r'(\d{1,2})' if num <= 2 else f'({_name_alternation(month_names)})',
+            )
+        elif char in 'abB':
+            regex_parts.append(f'({_name_alternation(period_names)})')
+        elif char in 'Eec':
+            if char in 'ec' and num < 3:
+                raise NotImplementedError(
+                    f"Parsing of numeric weekdays (field {char!r}) is not supported",
+                )
+            regex_parts.append(f'({_name_alternation(weekday_names)})')
+        elif char in 'ZxX':
+            offset = r'[+-]\d{2}(?::?\d{2})?(?::?\d{2})?'
+            regex_parts.append(f'(Z|{offset})' if char == 'X' else f'({offset})')
+        elif char == 'S':
+            regex_parts.append(r'(\d{1,9})')
+        else:  # d, h, H, K, k, m, s
+            regex_parts.append(r'(\d{1,2})')
+
+    match = re.fullmatch(''.join(regex_parts), string, flags=re.IGNORECASE)
+    if match is None:
+        raise ParseError(f"Input {string!r} does not match pattern {pattern!r}")
+
+    years: list[int] = []
+    months: list[int] = []
+    days: list[int] = []
+    weekdays: list[int] = []
+    hours: list[tuple[str, int]] = []
+    minutes: list[int] = []
+    seconds: list[int] = []
+    microseconds: list[int] = []
+    periods: list[str] = []
+    tzinfos: list[datetime.tzinfo] = []
+
+    for (char, num), text in zip(fields, match.groups()):
+        if char in 'yYu':
+            year = int(text)
+            years.append(_apply_year_pivot(year, pivot) if num == 2 else year)
+        elif char in 'ML':
+            months.append(int(text) if num <= 2 else month_names[text.lower()])
+        elif char == 'd':
+            days.append(int(text))
+        elif char in 'Eec':
+            weekdays.append(weekday_names[text.lower()])
+        elif char in 'hHKk':
+            hours.append((char, int(text)))
+        elif char == 'm':
+            minutes.append(int(text))
+        elif char == 's':
+            seconds.append(int(text))
+        elif char == 'S':
+            microseconds.append(int((text + '000000')[:6]))
+        elif char in 'abB':
+            periods.append(period_names[text.lower()])
+        elif char in 'ZxX':
+            tzinfos.append(_parse_tz_offset(text, allow_zulu=char == 'X'))
+
+    def _unique(values: list, what: str):
+        first = values[0]
+        if any(value != first for value in values[1:]):
+            raise ParseError(f"Conflicting {what} values in input: {values!r}")
+        return first
+
+    result: dict[str, object] = {}
+    if years:
+        result['year'] = _unique(years, 'year')
+    if months:
+        month = _unique(months, 'month')
+        if not 1 <= month <= 12:
+            raise ParseError(f"Month out of range: {month}")
+        result['month'] = month
+    if days:
+        day = _unique(days, 'day')
+        if not 1 <= day <= 31:
+            raise ParseError(f"Day out of range: {day}")
+        result['day'] = day
+    if weekdays:
+        result['weekday'] = _unique(weekdays, 'weekday')
+
+    period = _unique(periods, 'day period') if periods else None
+    resolved_hours = []
+    for char, value in hours:
+        if char == 'H':
+            if not 0 <= value <= 23:
+                raise ParseError(f"Hour out of range: {value}")
+            hour = value
+        elif char == 'k':
+            if not 1 <= value <= 24:
+                raise ParseError(f"Hour out of range: {value}")
+            hour = value % 24
+        elif char == 'h':
+            if not 1 <= value <= 12:
+                raise ParseError(f"Hour out of range: {value}")
+            if period is None:
+                hour = value
+            elif period == 'am':
+                hour = value % 12
+            elif period == 'pm':
+                hour = value % 12 + 12
+            else:  # noon or midnight
+                if value != 12:
+                    raise ParseError(f"Hour {value} is inconsistent with {period!r}")
+                hour = 12 if period == 'noon' else 0
+        else:  # char == 'K'
+            if not 0 <= value <= 11:
+                raise ParseError(f"Hour out of range: {value}")
+            if period in (None, 'am'):
+                hour = value
+            elif period == 'pm':
+                hour = value + 12
+            else:  # noon or midnight
+                if value != 0:
+                    raise ParseError(f"Hour {value} is inconsistent with {period!r}")
+                hour = 12 if period == 'noon' else 0
+        if period and char in 'Hk':
+            expected = {
+                'am': 0 <= hour < 12,
+                'pm': 12 <= hour < 24,
+                'noon': hour == 12,
+                'midnight': hour == 0,
+            }[period]
+            if not expected:
+                raise ParseError(f"Hour {hour} is inconsistent with {period!r}")
+        resolved_hours.append(hour)
+    if resolved_hours:
+        result['hour'] = _unique(resolved_hours, 'hour')
+    if minutes:
+        minute = _unique(minutes, 'minute')
+        if not 0 <= minute <= 59:
+            raise ParseError(f"Minute out of range: {minute}")
+        result['minute'] = minute
+    if seconds:
+        second = _unique(seconds, 'second')
+        if not 0 <= second <= 59:
+            raise ParseError(f"Second out of range: {second}")
+        result['second'] = second
+    if microseconds:
+        result['microsecond'] = _unique(microseconds, 'fractional second')
+    if period:
+        result['day_period'] = period
+    if tzinfos:
+        result['tzinfo'] = _unique(tzinfos, 'timezone offset')
+
+    if years and months and days:
+        try:
+            date = datetime.date(result['year'], result['month'], result['day'])
+        except ValueError as exc:
+            raise ParseError(f"Invalid date: {exc}") from exc
+        if weekdays and date.weekday() != result['weekday']:
+            raise ParseError(
+                f"Weekday {result['weekday']} does not match the date {date}",
+            )
+
+    return result
+
+
 class DateTimePattern:
     def __init__(self, pattern: str, format: DateTimeFormat):
         self.pattern = pattern

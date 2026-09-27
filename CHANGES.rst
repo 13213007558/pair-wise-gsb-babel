@@ -1,6 +1,16 @@
 Babel Changelog
 ===============
 
+Unreleased
+----------
+
+Features
+~~~~~~~~
+
+* Dates: Add `babel.dates.parse_datetime_pattern()` to parse a date/time string
+  according to an explicit pattern, recognizing localized month, weekday and
+  day-period names and numeric timezone offsets
+
 Version 2.18.0
 --------------
 
