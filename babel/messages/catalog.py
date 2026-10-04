@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, TypedDict
 from babel import __version__ as VERSION
 from babel.core import Locale, UnknownLocaleError
 from babel.dates import format_datetime
+from babel.messages.plural_check import PluralCheckReport, check_plural_expression
 from babel.messages.plurals import get_plural
 from babel.util import LOCALTZ, _cmp
 
@@ -697,6 +698,27 @@ class Catalog:
         'nplurals=3; plural=(n == 0 || n == 1) ? 0 : n != 0 && n % 1000000 == 0 ? 1 : 2;'
         """
         return f"nplurals={self.num_plurals}; plural={self.plural_expr};"
+
+    def check_plural_forms(
+        self,
+        max_period: int = 2_000_000,
+    ) -> PluralCheckReport:
+        """Safely validate this catalog's plural formula.
+
+        The original `plural_expr` text is never evaluated with Python's
+        :func:`eval` and is left untouched.  The returned report distinguishes
+        syntax errors, reachable division by zero, negative or
+        ``nplurals``-exceeding results, and declared but unreachable plural
+        forms.  Formulas outside the provable subset (constant comparisons and
+        constant modulo) are reported as ``unknown``.
+
+        >>> report = Catalog(locale='en').check_plural_forms()
+        >>> report.ok
+        True
+        >>> report.expression == Catalog(locale='en').plural_expr
+        True
+        """
+        return check_plural_expression(self.plural_expr, self.num_plurals, max_period=max_period)
 
     def __contains__(self, id: _MessageID) -> bool:
         """Return whether the catalog has a message with the specified ID."""
