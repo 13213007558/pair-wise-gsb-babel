@@ -25,6 +25,7 @@ from babel import __version__ as VERSION
 from babel.core import Locale, UnknownLocaleError
 from babel.dates import format_datetime
 from babel.messages.plurals import get_plural
+from babel.messages.plural_forms import PluralFormsCheckResult, check_plural_forms
 from babel.util import LOCALTZ, _cmp
 
 if TYPE_CHECKING:
@@ -379,6 +380,7 @@ class Catalog:
         language_team: str | None = None,
         charset: str | None = None,
         fuzzy: bool = True,
+        plural_forms: str | None = None,
     ) -> None:
         """Initialize the catalog object.
 
@@ -399,6 +401,7 @@ class Catalog:
         :param language_team: the name and email of the language team
         :param charset: the encoding to use in the output (defaults to utf-8)
         :param fuzzy: the fuzzy bit on the catalog header
+        :param plural_forms: an explicit raw ``Plural-Forms`` header value
         """
         self.domain = domain
         self.locale = locale
@@ -434,6 +437,16 @@ class Catalog:
         self.obsolete: dict[str | tuple[str, str], Message] = {}
         self._num_plurals = None
         self._plural_expr = None
+        self._plural_forms_header = plural_forms
+        if plural_forms is not None:
+            params = parse_separated_header(f" ;{plural_forms}")
+            nplurals = params.get('nplurals')
+            if nplurals is not None:
+                try:
+                    self._num_plurals = int(nplurals)
+                except ValueError:
+                    self._num_plurals = None
+            self._plural_expr = params.get('plural')
 
     def _set_locale(self, locale: Locale | str | None) -> None:
         if locale is None:
@@ -588,8 +601,13 @@ class Catalog:
                 if 'charset' in params:
                     self.charset = params['charset'].lower()
             elif name == 'plural-forms':
+                self._plural_forms_header = value
                 params = parse_separated_header(f" ;{value}")
-                self._num_plurals = int(params.get('nplurals', 2))
+                nplurals = params.get('nplurals', 2)
+                try:
+                    self._num_plurals = int(nplurals)
+                except ValueError:
+                    self._num_plurals = None
                 self._plural_expr = params.get('plural', '(n != 1)')
             elif name == 'pot-creation-date':
                 self.creation_date = _parse_datetime_header(value)
@@ -696,7 +714,13 @@ class Catalog:
         >>> Catalog(locale='pt_BR').plural_forms
         'nplurals=3; plural=(n == 0 || n == 1) ? 0 : n != 0 && n % 1000000 == 0 ? 1 : 2;'
         """
+        if self._plural_forms_header is not None:
+            return self._plural_forms_header
         return f"nplurals={self.num_plurals}; plural={self.plural_expr};"
+
+    def check_plural_forms(self) -> PluralFormsCheckResult:
+        """Validate the catalog's raw Plural-Forms declaration."""
+        return check_plural_forms(self.plural_forms)
 
     def __contains__(self, id: _MessageID) -> bool:
         """Return whether the catalog has a message with the specified ID."""
@@ -867,7 +891,11 @@ class Catalog:
         self[id] = message
         return message
 
-    def check(self) -> Iterable[tuple[Message, list[TranslationError]]]:
+    def check(
+        self,
+        *,
+        plural_forms: bool = False,
+    ) -> Iterable[tuple[Message, list[TranslationError]]]:
         """Run various validation checks on the translations in the catalog.
 
         For every message which fails validation, this method yield a
@@ -875,7 +903,15 @@ class Catalog:
         and ``errors`` is a sequence of `TranslationError` objects.
 
         :rtype: ``generator`` of ``(message, errors)``
+        :param plural_forms: also validate the catalog's ``Plural-Forms`` header
         """
+        if plural_forms:
+            result = self.check_plural_forms()
+            if result.status not in ('safe', 'unknown'):
+                message = Message('')
+                errors = [TranslationError(issue.message) for issue in result.issues]
+                yield message, errors
+
         for message in self._messages.values():
             errors = message.check(catalog=self)
             if errors:
